@@ -1,0 +1,18 @@
+{
+  "name": "tracknow",
+  "version": "0.1.0",
+  "description": "TrackNow: trustworthy live dispatch (PS08 prototype). Zero npm dependencies; needs Node 22+ and Redis 6.2+.",
+  "engines": { "node": ">=22.5" },
+  "scripts": {
+    "start": "node dev/stack.js --real-redis",
+    "start:dev-redis": "node dev/stack.js",
+    "app1": "PORT=3001 INSTANCE_ID=app1 PEERS=http://localhost:3001,http://localhost:3002 node --no-warnings src/server.js",
+    "app2": "PORT=3002 INSTANCE_ID=app2 PEERS=http://localhost:3001,http://localhost:3002 node --no-warnings src/server.js",
+    "worker": "node --no-warnings src/worker.js",
+    "sim:riders": "node sim/riders.js --riders 2000",
+    "sim:viewers": "node sim/viewers.js --viewers 3000 --orders 400",
+    "build:luahost": "sh dev/lua-host/build.sh",
+    "test": "node test/run.js",
+    "test:real-redis": "node test/run.js --real-redis"
+  }
+}

@@ -1,0 +1,332 @@
+<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>TrackNow · Restaurant Board</title><link rel="stylesheet" href="style.css"></head>
+<body>
+<div class="bar">
+  <h1>TrackNow <span class="sub">Restaurant Order Board</span></h1>
+  <div class="chips">
+    <span class="chip" id="cConn"><i></i><b>Connecting…</b></span>
+    <span class="chip" id="cRedis" style="display:none"><i></i><b>Redis</b></span>
+    <a class="chip" href="index.html" target="_blank">🗺 Dispatch map</a>
+    <a class="chip" href="track.html" target="_blank">📦 Track order</a>
+  </div>
+</div>
+<div class="boardbar">
+  <button class="btn primary" id="add" style="background:var(--indigo);color:#fff;border-color:var(--indigo);font-weight:600">+ Place test order</button>
+  <button class="btn" id="assignAll">Assign riders to unassigned</button>
+  <label class="chip ok" style="cursor:pointer;user-select:none;display:inline-flex;align-items:center;gap:8px" title="When active, accepting an order automatically assigns the nearest rider and progresses through cooking, pickup, and delivery">
+    <input type="checkbox" id="autoPilot" checked style="cursor:pointer">
+    <b>⚡ Kitchen Auto-Pilot: ON</b>
+  </label>
+  <span class="hint">Accepting an order triggers automatic rider assignment, kitchen prep, handover, and delivery!</span>
+</div>
+<div id="redisWarning" style="display:none;background:#fff5f5;border-bottom:2px solid var(--red);padding:8px 20px;color:var(--red);font-weight:600;font-size:13.5px">
+  ⚠ Redis is down — rider assignment is paused. Order status changes still work.
+</div>
+<div class="cols" id="cols"></div>
+<div class="toast" id="toast" role="status"></div>
+
+<script src="common.js"></script>
+<script>
+const $ = (id) => document.getElementById(id);
+const FLOW = ['placed', 'accepted', 'preparing', 'picked_up', 'delivered', 'cancelled'];
+const COL_LABELS = { placed: 'Placed', accepted: 'Accepted', preparing: 'Preparing', picked_up: 'Picked up', delivered: 'Delivered', cancelled: 'Cancelled' };
+const COL_COLORS = { placed: '#a8650c', accepted: '#3f3db8', preparing: '#3f3db8', picked_up: '#0b7a75', delivered: '#0b7a75', cancelled: '#c4302b' };
+const NEXT = {
+  placed: [['accepted', 'Accept order', true]],
+  accepted: [['preparing', 'Start preparing', true]],
+  preparing: [['picked_up', 'Hand to rider', true]],
+  picked_up: [['delivered', 'Mark delivered', true]],
+};
+const orders = new Map(), pending = new Set();
+const autoTimers = new Map(); // orderId -> { timer, stage, remaining, total }
+let redisUp = true;
+let toastT, dragId = null;
+
+function toast(msg, isError = false) {
+  const e = $('toast');
+  e.textContent = msg;
+  e.className = 'toast show' + (isError ? ' error' : '');
+  clearTimeout(toastT);
+  toastT = setTimeout(() => (e.className = 'toast'), 4000);
+}
+
+function render() {
+  $('cols').innerHTML = FLOW.map((s) => {
+    const list = [...orders.values()].filter((o) => o.status === s).sort((a, b) => b.updated_at - a.updated_at);
+    const color = COL_COLORS[s] || 'var(--muted)';
+    return `<section class="col" data-s="${s}">
+      <h3 style="border-top:3px solid ${color};border-radius:10px 10px 0 0">
+        ${COL_LABELS[s]}
+        <span class="col-badge">${list.length}</span>
+      </h3>
+      <div class="cards">
+        ${list.map((o) => cardHTML(o)).join('')}
+        ${list.length === 0 ? `<div style="color:var(--muted);font-size:12.5px;text-align:center;padding:20px 0;font-style:italic">No orders</div>` : ''}
+      </div>
+    </section>`;
+  }).join('');
+  attachDragListeners();
+}
+
+function cardHTML(o) {
+  const isPending = pending.has(o.id);
+  const nexts = NEXT[o.status] || [];
+  const canCancel = ['placed', 'accepted', 'preparing'].includes(o.status);
+  const canAssign = !o.rider_id && !['delivered', 'cancelled'].includes(o.status);
+  const auto = autoTimers.get(o.id);
+
+  const riderBadge = o.rider_id
+    ? `<span class="rider-badge">🛵 ${o.rider_id}</span>`
+    : `<span class="no-rider">No rider assigned</span>`;
+
+  let autoBar = '';
+  if (auto && auto.remaining > 0) {
+    const pct = Math.max(0, Math.min(100, Math.round(((auto.total - auto.remaining) / auto.total) * 100)));
+    autoBar = `
+      <div style="margin:8px 0 4px;font-size:11.5px;color:var(--indigo);font-weight:600">
+        ${auto.label} (${auto.remaining}s)
+        <div style="height:5px;background:#e2e5f5;border-radius:99px;margin-top:3px;overflow:hidden">
+          <div style="height:100%;width:${pct}%;background:var(--indigo);transition:width .9s linear"></div>
+        </div>
+      </div>
+    `;
+  }
+
+  return `<div class="card${isPending ? ' pending' : ''}" draggable="${!isPending}" data-id="${o.id}">
+    <b>${o.id}</b>
+    <div class="meta">
+      ${riderBadge}
+      ${o.batch_id ? `<span style="font-size:11px;color:var(--muted)">batch</span>` : ''}
+    </div>
+    ${autoBar}
+    <div class="act">
+      ${nexts.map(([to, label, primary]) => `<button class="btn${primary ? ' primary' : ''}" data-go="${to}"${isPending ? ' disabled' : ''}>${label}</button>`).join('')}
+      ${canAssign ? `<button class="btn" data-assign="1"${isPending || !redisUp ? ' disabled' : ''} title="${!redisUp ? 'Assignment paused: Redis is down' : ''}">Assign rider</button>` : ''}
+      ${canCancel ? `<button class="btn danger" data-go="cancelled"${isPending ? ' disabled' : ''}>Cancel</button>` : ''}
+      <a class="btn" href="track.html?order=${o.id}" target="_blank" style="text-decoration:none">Track →</a>
+    </div>
+  </div>`;
+}
+
+// Kitchen Auto-Pilot Pipeline:
+// When an order is accepted, it auto-assigns rider, prepares, hands to rider, and completes delivery!
+function triggerAutoPilot(orderId, currentStatus) {
+  if (!$('autoPilot') || !$('autoPilot').checked) return;
+
+  const o = orders.get(orderId);
+  if (!o || o.status === 'delivered' || o.status === 'cancelled') {
+    clearAutoTimer(orderId);
+    return;
+  }
+
+  // Clear existing timer if any
+  clearAutoTimer(orderId);
+
+  if (currentStatus === 'accepted') {
+    // 1. Immediately auto-assign rider if not assigned
+    if (!o.rider_id) {
+      assignRider(orderId).then(() => {
+        startCountdown(orderId, '🍳 Kitchen cooking food', 4, () => {
+          move(orderId, 'preparing');
+        });
+      });
+    } else {
+      startCountdown(orderId, '🍳 Kitchen cooking food', 4, () => {
+        move(orderId, 'preparing');
+      });
+    }
+  } else if (currentStatus === 'preparing') {
+    // 2. Preparing -> packaging and hand to rider (4s)
+    startCountdown(orderId, '📦 Packaging for rider', 4, async () => {
+      const cur = orders.get(orderId);
+      if (cur && !cur.rider_id) await assignRider(orderId);
+      move(orderId, 'picked_up');
+    });
+  } else if (currentStatus === 'picked_up') {
+    // 3. Out for delivery -> travels to customer (8s)
+    startCountdown(orderId, '🛵 En route to customer', 8, () => {
+      move(orderId, 'delivered');
+    });
+  }
+}
+
+function startCountdown(orderId, label, seconds, onComplete) {
+  let remaining = seconds;
+  const state = { label, remaining, total: seconds };
+  autoTimers.set(orderId, state);
+  render();
+
+  const interval = setInterval(() => {
+    remaining--;
+    state.remaining = remaining;
+    if (remaining <= 0) {
+      clearInterval(interval);
+      autoTimers.delete(orderId);
+      render();
+      onComplete();
+    } else {
+      render();
+    }
+  }, 1000);
+
+  state.interval = interval;
+}
+
+function clearAutoTimer(orderId) {
+  const existing = autoTimers.get(orderId);
+  if (existing && existing.interval) clearInterval(existing.interval);
+  autoTimers.delete(orderId);
+}
+
+async function move(id, to) {
+  const o = orders.get(id);
+  if (!o || o.status === to || pending.has(id)) return;
+  if (to === 'picked_up' && !o.rider_id) {
+    // Auto-assign rider first if possible
+    await assignRider(id);
+    const updated = orders.get(id);
+    if (!updated || !updated.rider_id) {
+      toast('Assign a rider before handing over to rider.', true);
+      return;
+    }
+  }
+  const prev = { ...o };
+  o.status = to; pending.add(id); render();
+  const r = await TN.api(`/api/orders/${id}/status`, { to, requestId: TN.rid() });
+  pending.delete(id);
+  if (r.status !== 200) {
+    orders.set(id, prev);
+    clearAutoTimer(id);
+    const msg = r.body.error === 'INVALID_TRANSITION'
+      ? `Transition not allowed: ${(r.body.detail || '').replace('->', '→')}.`
+      : r.body.error === 'NO_RIDER_ASSIGNED'
+        ? 'Assign a rider before marking as picked up.'
+        : 'Could not update order: ' + (r.body.error || r.status);
+    toast(msg, true);
+  } else if (r.body.order) {
+    orders.set(id, r.body.order);
+    // Continue Auto-Pilot pipeline
+    triggerAutoPilot(id, to);
+  }
+  render();
+}
+
+async function assignRider(id) {
+  const r = await TN.api(`/api/orders/${id}/assign`, {});
+  if (r.status === 200) {
+    toast(`✓ Assigned rider ${r.body.riderId} to order ${id}.`);
+    if (r.body.orders) for (const o of r.body.orders) orders.set(o.id, o);
+    render();
+    return r.body.riderId;
+  } else {
+    const msg = r.body.error === 'REDIS_UNAVAILABLE' ? 'Assignment paused — Redis is currently unavailable.'
+      : r.body.error === 'NO_RIDER_AVAILABLE' ? 'No available rider nearby right now.'
+      : 'Assignment failed: ' + r.body.error;
+    toast(msg, true);
+    return null;
+  }
+}
+
+$('cols').addEventListener('click', async (e) => {
+  const card = e.target.closest('.card'); if (!card) return;
+  const id = card.dataset.id;
+  if (e.target.dataset.go) {
+    await move(id, e.target.dataset.go);
+  } else if (e.target.dataset.assign) {
+    await assignRider(id);
+  }
+});
+
+function attachDragListeners() {
+  document.querySelectorAll('.card[draggable=true]').forEach((card) => {
+    card.addEventListener('dragstart', (e) => {
+      dragId = card.dataset.id;
+      card.classList.add('dragging');
+      e.dataTransfer.setData('text/plain', dragId);
+      e.dataTransfer.effectAllowed = 'move';
+    });
+    card.addEventListener('dragend', () => { card.classList.remove('dragging'); dragId = null; });
+  });
+  document.querySelectorAll('.col').forEach((col) => {
+    col.addEventListener('dragover', (e) => {
+      e.preventDefault();
+      e.dataTransfer.dropEffect = 'move';
+      document.querySelectorAll('.col.over').forEach((x) => x.classList.remove('over'));
+      col.classList.add('over');
+    });
+    col.addEventListener('dragleave', (e) => {
+      if (!col.contains(e.relatedTarget)) col.classList.remove('over');
+    });
+    col.addEventListener('drop', (e) => {
+      e.preventDefault();
+      document.querySelectorAll('.col.over').forEach((x) => x.classList.remove('over'));
+      const id = e.dataTransfer.getData('text/plain') || dragId;
+      if (id) move(id, col.dataset.s);
+    });
+  });
+}
+
+$('add').onclick = async () => {
+  const lat = 17.37 + Math.random() * 0.12, lng = 78.37 + Math.random() * 0.16;
+  const r = await TN.api('/api/orders', {
+    restaurantId: 'rest-1', customerId: 'cust-' + TN.rid(),
+    pickup: { lat, lng }, dropoff: { lat: 17.43, lng: 78.45 }
+  });
+  if (r.status === 201) {
+    toast(`✓ Order ${r.body.order.id} placed. Click "Accept order" to begin!`);
+  } else {
+    toast('Could not place order: ' + r.body.error, true);
+  }
+};
+
+$('assignAll').onclick = async () => {
+  const unassigned = [...orders.values()].filter((o) => !o.rider_id && !['delivered', 'cancelled'].includes(o.status));
+  if (!unassigned.length) { toast('No unassigned orders.'); return; }
+  let ok = 0, fail = 0;
+  for (const o of unassigned.slice(0, 5)) {
+    const r = await TN.api(`/api/orders/${o.id}/assign`, {});
+    if (r.status === 200) { ok++; if (r.body.orders) for (const ord of r.body.orders) orders.set(ord.id, ord); }
+    else fail++;
+  }
+  toast(`Assigned ${ok} order(s).${fail > 0 ? ` ${fail} failed.` : ''}`);
+  render();
+};
+
+function setConn(s) {
+  const e = $('cConn');
+  e.className = 'chip ' + (s === 'live' ? 'ok' : s === 'offline' ? 'bad' : 'warn');
+  e.querySelector('b').textContent = s === 'live' ? 'Live' : s === 'offline' ? 'Offline' : 'Reconnecting…';
+}
+
+TN.connect({ kind: 'board',
+  onState: (s) => setConn(s),
+  onMsg: (d) => {
+    if (d.t === 'snap') {
+      orders.clear();
+      for (const o of d.orders) orders.set(o.id, o);
+      redisUp = d.redis !== false;
+      $('redisWarning').style.display = redisUp ? 'none' : '';
+      render();
+    } else if (d.t === 'order') {
+      const cur = orders.get(d.order.id);
+      if (!cur || d.order.version >= cur.version) {
+        orders.set(d.order.id, d.order);
+      }
+      render();
+    } else if (d.t === 'hb') {
+      redisUp = d.redis !== false;
+      $('redisWarning').style.display = redisUp ? 'none' : '';
+      const rc = $('cRedis'); rc.style.display = '';
+      rc.className = 'chip ' + (redisUp ? 'ok' : 'bad');
+      rc.querySelector('b').textContent = redisUp ? 'Redis OK' : 'Redis down';
+    } else if (d.t === 'reset') {
+      orders.clear();
+      for (const t of autoTimers.values()) if (t.interval) clearInterval(t.interval);
+      autoTimers.clear();
+      render();
+    }
+  }
+});
+render();
+</script></body></html>

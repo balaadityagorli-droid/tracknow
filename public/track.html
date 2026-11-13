@@ -1,0 +1,450 @@
+<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>TrackNow · Live Delivery Tracking</title><link rel="stylesheet" href="style.css"></head>
+<body>
+<div class="bar">
+  <h1>TrackNow <span class="sub">Live Order Tracking</span></h1>
+  <div class="chips">
+    <span class="chip" id="cConn"><i></i><b>Connecting…</b></span>
+    <span class="chip" id="cRedis" style="display:none"><i></i><b>Live</b></span>
+    <a class="chip" href="board.html" target="_blank">🍴 Restaurant board</a>
+    <a class="chip" href="index.html" target="_blank">🗺 Dispatch map</a>
+  </div>
+</div>
+<div class="track">
+  <div class="mapwrap">
+    <canvas id="map"></canvas>
+    <div class="banner" id="mapBanner"></div>
+    <div class="maptools" style="right:14px;left:auto;top:14px;gap:6px">
+      <button class="btn" id="zIn" style="padding:4px 10px;font-weight:700" title="Zoom in">+</button>
+      <button class="btn" id="zOut" style="padding:4px 10px;font-weight:700" title="Zoom out">−</button>
+      <button class="btn" id="recenter" style="padding:4px 10px" title="Fit route">⛶ Fit</button>
+    </div>
+    <!-- Floating Live HUD -->
+    <div id="liveHud" style="position:absolute;bottom:20px;left:20px;right:20px;max-width:420px;background:rgba(255,255,255,0.95);backdrop-filter:blur(8px);border:1px solid var(--line);border-radius:12px;padding:12px 16px;box-shadow:0 6px 20px rgba(0,0,0,0.12);display:flex;align-items:center;justify-content:space-between;gap:12px;z-index:4">
+      <div style="display:flex;align-items:center;gap:12px">
+        <div id="hudIcon" style="width:40px;height:40px;border-radius:50%;background:#f0f4fd;display:grid;place-items:center;font-size:20px;flex-shrink:0">🛵</div>
+        <div>
+          <div id="hudTitle" style="font-weight:700;font-size:14px;color:var(--ink)">Finding nearby rider…</div>
+          <div id="hudSub" style="font-size:12px;color:var(--muted);margin-top:2px">Order placed with restaurant</div>
+        </div>
+      </div>
+      <div style="text-align:right">
+        <div id="hudEta" style="font-weight:750;font-size:16px;color:var(--indigo)">--</div>
+        <div id="hudDist" style="font-size:11.5px;color:var(--muted)">distance</div>
+      </div>
+    </div>
+  </div>
+  <aside class="side">
+    <h2 id="title">Your Order</h2>
+    <div class="order-id" id="orderIdLabel"></div>
+
+    <!-- Order progress stepper -->
+    <div class="stepper" id="stepper"></div>
+
+    <!-- Connection / status banner -->
+    <div class="conn-banner" id="connBanner">
+      <div class="dot-ind"></div>
+      <div>
+        <span class="conn-title" id="bannerTitle">Connecting…</span>
+        <span class="conn-sub" id="bannerSub">Establishing real-time connection.</span>
+      </div>
+    </div>
+
+    <!-- Key facts -->
+    <dl class="facts">
+      <dt>Assigned Rider</dt>
+      <dd id="rider" class="rider-id">Not assigned yet</dd>
+      <dt>Status Phase</dt>
+      <dd id="phaseText" style="color:var(--indigo)">Preparing</dd>
+      <dt>Distance Remaining</dt>
+      <dd id="dist" class="num">–</dd>
+      <dt>Estimated Arrival</dt>
+      <dd id="eta" class="num">–</dd>
+      <dt>GPS Last Received</dt>
+      <dd id="age" class="num">–</dd>
+      <dt>Connected Instance</dt>
+      <dd id="inst" class="num">–</dd>
+    </dl>
+
+    <!-- Status timeline -->
+    <div class="timeline">
+      <h3>Live tracking events</h3>
+      <ul class="feed" id="feed"></ul>
+    </div>
+  </aside>
+</div>
+<script src="common.js"></script>
+<script>
+const $ = (id) => document.getElementById(id);
+const orderId = new URLSearchParams(location.search).get('order');
+let order = null, markerAnim = null, trail = [], lastSeq = -1, lastLocAt = 0, lastVer = 0;
+let conn = 'connecting', redisOk = true, shown = 0, lastFrameTs = Date.now();
+const feed = new Map();
+
+// Synthetic simulated progression along route if real GPS is not yet streaming
+let simPhase = 'to_pickup'; // 'to_pickup' | 'to_dropoff' | 'arrived'
+let simProgress = 0.05;
+
+// ---- canvas map ----
+const map = new TN.MapView($('map'), { draw(x, p) {
+  if (!order) return;
+  const pick = p(order.pickup_lat, order.pickup_lng);
+  const drop = p(order.drop_lat, order.drop_lng);
+
+  // 1. Draw Delivery Route Line
+  x.lineWidth = 4;
+  x.lineCap = 'round';
+  x.lineJoin = 'round';
+
+  // Planned leg: Restaurant -> Customer
+  x.strokeStyle = 'rgba(11, 122, 117, 0.45)';
+  x.setLineDash([8, 6]);
+  x.beginPath();
+  x.moveTo(pick[0], pick[1]);
+  x.lineTo(drop[0], drop[1]);
+  x.stroke();
+  x.setLineDash([]);
+
+  // Active breadcrumb trail
+  if (trail.length > 1) {
+    x.strokeStyle = TN.css('--indigo');
+    x.lineWidth = 3;
+    x.globalAlpha = 0.55;
+    x.beginPath();
+    trail.forEach((t, i) => {
+      const q = p(t[0], t[1]);
+      i ? x.lineTo(q[0], q[1]) : x.moveTo(q[0], q[1]);
+    });
+    x.stroke();
+    x.globalAlpha = 1;
+  }
+
+  // 2. Draw 3D Restaurant Pin
+  drawPin(x, pick[0], pick[1], '#e07a16', '🍴', 'Restaurant (Pickup)');
+
+  // 3. Draw 3D Customer Home Pin
+  drawPin(x, drop[0], drop[1], '#0b7a75', '🏠', 'Delivery Address (You)');
+
+  // 4. Update & Draw Synchronized Rider Scooter
+  const now = Date.now(), dt = now - lastFrameTs;
+  lastFrameTs = now;
+
+  // Compute rider position:
+  // If order status is accepted/preparing: rider heads to restaurant!
+  // If order status is picked_up: rider heads from restaurant to customer!
+  // If delivered: rider is at customer!
+  let rlat, rlng, headingAngle = 0;
+
+  if (markerAnim) {
+    markerAnim.tick(dt);
+    [rlat, rlng] = markerAnim.pos();
+    headingAngle = markerAnim.heading();
+  } else if (order.rider_id) {
+    // Generate initial position nearby if no GPS arrived yet
+    if (order.status === 'picked_up') {
+      simProgress = Math.min(0.98, simProgress + (dt / 25000));
+      rlat = order.pickup_lat + (order.drop_lat - order.pickup_lat) * simProgress;
+      rlng = order.pickup_lng + (order.drop_lng - order.pickup_lng) * simProgress;
+      headingAngle = Math.atan2(order.drop_lng - order.pickup_lng, order.drop_lat - order.pickup_lat);
+    } else if (order.status === 'delivered') {
+      rlat = order.drop_lat;
+      rlng = order.drop_lng;
+    } else {
+      // heading to restaurant
+      simProgress = Math.min(0.95, simProgress + (dt / 20000));
+      const startLat = order.pickup_lat - 0.008, startLng = order.pickup_lng - 0.008;
+      rlat = startLat + (order.pickup_lat - startLat) * simProgress;
+      rlng = startLng + (order.pickup_lng - startLng) * simProgress;
+      headingAngle = Math.atan2(order.pickup_lng - startLng, order.pickup_lat - startLat);
+    }
+  }
+
+  if (rlat && rlng) {
+    const q = p(rlat, rlng);
+    const isStale = lastLocAt > 0 && now - lastLocAt > 6000;
+    drawScooter(x, q[0], q[1], headingAngle, order.rider_id || 'Rider', isStale);
+  }
+} });
+
+function drawPin(x, px, py, color, icon, label) {
+  // Shadow
+  x.beginPath();
+  x.ellipse(px, py + 4, 12, 5, 0, 0, 6.3);
+  x.fillStyle = 'rgba(0,0,0,0.2)';
+  x.fill();
+
+  // Pin circle
+  x.beginPath();
+  x.arc(px, py - 18, 14, 0, 6.3);
+  x.fillStyle = color;
+  x.fill();
+  x.strokeStyle = '#fff';
+  x.lineWidth = 2.5;
+  x.stroke();
+
+  // Pointer tip
+  x.beginPath();
+  x.moveTo(px - 6, py - 8);
+  x.lineTo(px, py);
+  x.lineTo(px + 6, py - 8);
+  x.fillStyle = color;
+  x.fill();
+
+  // Icon
+  x.font = '13px sans-serif';
+  x.textAlign = 'center';
+  x.textBaseline = 'middle';
+  x.fillStyle = '#fff';
+  x.fillText(icon, px, py - 18);
+
+  // Label badge
+  x.font = 'bold 11px system-ui, sans-serif';
+  x.textBaseline = 'alphabetic';
+  const tw = x.measureText(label).width;
+  x.fillStyle = 'rgba(255,255,255,0.95)';
+  x.fillRect(px - tw / 2 - 6, py + 8, tw + 12, 18);
+  x.strokeStyle = color;
+  x.lineWidth = 1;
+  x.strokeRect(px - tw / 2 - 6, py + 8, tw + 12, 18);
+  x.fillStyle = '#17262b';
+  x.fillText(label, px, py + 21);
+}
+
+function drawScooter(x, px, py, heading, riderId, isStale) {
+  x.save();
+  x.translate(px, py);
+
+  // Pulsing sonar ring
+  const pulse = (Date.now() % 1600) / 1600;
+  x.beginPath();
+  x.arc(0, 0, 16 + pulse * 14, 0, 6.3);
+  x.fillStyle = isStale ? 'rgba(139,154,159,0.15)' : 'rgba(63,61,184,' + (0.35 - pulse * 0.3) + ')';
+  x.fill();
+
+  // Base shadow
+  x.beginPath();
+  x.ellipse(0, 2, 13, 6, 0, 0, 6.3);
+  x.fillStyle = 'rgba(0,0,0,0.28)';
+  x.fill();
+
+  // Scooter badge
+  x.beginPath();
+  x.arc(0, 0, 14, 0, 6.3);
+  x.fillStyle = isStale ? '#8b9a9f' : '#3f3db8';
+  x.fill();
+  x.strokeStyle = '#ffffff';
+  x.lineWidth = 2.5;
+  x.stroke();
+
+  // Scooter icon
+  x.font = '14px sans-serif';
+  x.textAlign = 'center';
+  x.textBaseline = 'middle';
+  x.fillText('🛵', 0, 1);
+
+  // Overhead speech bubble with Rider ID
+  x.font = 'bold 11px system-ui, sans-serif';
+  x.textBaseline = 'alphabetic';
+  const tag = `🛵 ${riderId}`;
+  const tw = x.measureText(tag).width;
+  x.fillStyle = '#17262b';
+  x.fillRect(-tw / 2 - 5, -28, tw + 10, 16);
+  x.fillStyle = '#ffffff';
+  x.fillText(tag, 0, -16);
+
+  x.restore();
+}
+
+function refit() {
+  if (!order) return;
+  const pts = [[order.pickup_lat, order.pickup_lng], [order.drop_lat, order.drop_lng]];
+  if (markerAnim) {
+    const [a, b] = markerAnim.pos();
+    pts.push([a, b]);
+  }
+  map.fit(pts, 90);
+}
+
+$('zIn').onclick = () => map.zoomIn();
+$('zOut').onclick = () => map.zoomOut();
+$('recenter').onclick = () => refit();
+
+function setOrder(o) {
+  order = o;
+  $('title').textContent = TN.STATUS[o.status] || 'Order';
+  $('orderIdLabel').textContent = 'Order ' + o.id;
+  $('rider').textContent = o.rider_id ? `🛵 ${o.rider_id}` : 'Searching nearby…';
+  renderStepper(o.status);
+  updateHudAndMetrics();
+}
+
+const STEPS = [
+  { key: 'placed', label: 'Placed' },
+  { key: 'accepted', label: 'Accepted' },
+  { key: 'preparing', label: 'Preparing' },
+  { key: 'picked_up', label: 'Out for delivery' },
+  { key: 'delivered', label: 'Delivered' },
+];
+
+function renderStepper(status) {
+  if (status === 'cancelled') {
+    $('stepper').innerHTML = '<span style="color:var(--red);font-weight:700;font-size:13px">Order cancelled</span>';
+    return;
+  }
+  const idx = STEPS.findIndex((s) => s.key === status);
+  $('stepper').innerHTML = STEPS.map((s, i) => {
+    const cls = i < idx ? 'done' : i === idx ? 'active' : '';
+    const mark = i < idx ? '✓' : i + 1;
+    return `<div class="step ${cls}"><div class="step-dot">${mark}</div><div class="step-label">${s.label}</div></div>`;
+  }).join('');
+}
+
+function updateHudAndMetrics() {
+  if (!order) return;
+
+  const st = order.status;
+  const hTitle = $('hudTitle'), hSub = $('hudSub'), hEta = $('hudEta'), hDist = $('hudDist'), hIcon = $('hudIcon');
+  const phaseText = $('phaseText');
+
+  let curLat = order.pickup_lat, curLng = order.pickup_lng;
+  if (markerAnim) {
+    [curLat, curLng] = markerAnim.pos();
+  }
+
+  if (st === 'placed') {
+    hTitle.textContent = 'Order Placed';
+    hSub.textContent = 'Waiting for restaurant confirmation…';
+    hEta.textContent = '--';
+    hDist.textContent = 'Queued';
+    hIcon.textContent = '📝';
+    phaseText.textContent = 'Restaurant confirmation';
+  } else if (st === 'accepted') {
+    hTitle.textContent = order.rider_id ? `Rider ${order.rider_id} Assigned` : 'Order Accepted';
+    hSub.textContent = 'Rider heading to restaurant to collect food';
+    const dist = TN.hav(curLat, curLng, order.pickup_lat, order.pickup_lng);
+    hEta.textContent = TN.fmtEta(dist);
+    hDist.textContent = `${TN.fmtDist(dist)} to pickup`;
+    hIcon.textContent = '🛵';
+    phaseText.textContent = 'Heading to restaurant';
+    $('dist').textContent = `${TN.fmtDist(dist)} to pickup`;
+    $('eta').textContent = TN.fmtEta(dist);
+  } else if (st === 'preparing') {
+    hTitle.textContent = 'Kitchen Preparing Order';
+    hSub.textContent = 'Chef is cooking your fresh meal';
+    const dist = TN.hav(curLat, curLng, order.drop_lat, order.drop_lng);
+    hEta.textContent = 'Prep (~3m)';
+    hDist.textContent = `${TN.fmtDist(dist)} total`;
+    hIcon.textContent = '🍳';
+    phaseText.textContent = 'Kitchen Cooking';
+    $('dist').textContent = `${TN.fmtDist(dist)} total`;
+    $('eta').textContent = 'Prep in progress';
+  } else if (st === 'picked_up') {
+    hTitle.textContent = 'Out for Delivery';
+    hSub.textContent = `Rider ${order.rider_id || ''} is on the way to your address!`;
+    const dist = TN.hav(curLat, curLng, order.drop_lat, order.drop_lng);
+    hEta.textContent = TN.fmtEta(dist);
+    hDist.textContent = `${TN.fmtDist(dist)} away`;
+    hIcon.textContent = '🛵';
+    phaseText.textContent = 'Out for Delivery';
+    $('dist').textContent = `${TN.fmtDist(dist)} to your home`;
+    $('eta').textContent = TN.fmtEta(dist);
+  } else if (st === 'delivered') {
+    hTitle.textContent = 'Delivered! 🎉';
+    hSub.textContent = 'Your order has arrived. Enjoy your meal!';
+    hEta.textContent = 'Arrived';
+    hDist.textContent = '0 m';
+    hIcon.textContent = '✅';
+    phaseText.textContent = 'Completed';
+    $('dist').textContent = 'Arrived';
+    $('eta').textContent = 'Delivered';
+  }
+}
+
+function addNotif(n) {
+  if (n.version <= lastVer && feed.has(n.version)) return false;
+  lastVer = Math.max(lastVer, n.version); feed.set(n.version, n);
+  const sorted = [...feed.values()].sort((a, b) => b.version - a.version);
+  const evCls = { delivered: 'ev-delivered', cancelled: 'ev-cancelled', placed: 'ev-placed' };
+  $('feed').innerHTML = sorted.map((x) =>
+    `<li class="${evCls[x.status] || ''}"><div class="dot-ev"></div><div class="ev-info"><div class="ev-status">${TN.STATUS[x.status]}</div><div class="ev-time">${x.delivered_at ? new Date(x.delivered_at).toLocaleTimeString() : 'processed'} · v${x.version}</div></div></li>`
+  ).join('');
+  return true;
+}
+
+function paint() {
+  const bn = $('connBanner');
+  let cls = 'ok', title = 'Live tracking connected', sub = 'Real-time GPS updates stream every second.';
+  if (conn === 'offline') {
+    cls = 'bad'; title = 'You are offline'; sub = 'Connection lost. Map will resume when internet returns.';
+  } else if (conn !== 'live') {
+    cls = 'warn'; title = 'Reconnecting…'; sub = 'Rotating to backup instance. No updates missed.';
+  } else if (!redisOk) {
+    cls = 'warn'; title = 'Live tracking paused'; sub = 'Redis is recovering. Order data safe in DB.';
+  }
+  bn.className = 'conn-banner' + (cls ? ' ' + cls : '');
+  $('bannerTitle').textContent = title;
+  $('bannerSub').textContent = sub;
+
+  const chip = $('cConn');
+  chip.className = 'chip ' + (conn === 'live' ? 'ok' : conn === 'offline' ? 'bad' : 'warn');
+  chip.querySelector('b').textContent = conn === 'live' ? 'Live' : conn === 'offline' ? 'Offline' : 'Reconnecting…';
+
+  $('age').textContent = lastLocAt ? Math.round((Date.now() - lastLocAt) / 1000) + ' s ago' : 'Live';
+  updateHudAndMetrics();
+  map.dirty = true;
+}
+setInterval(paint, 1000);
+
+const c = TN.connect({
+  kind: 'track',
+  order: orderId,
+  onState: (s, ep) => {
+    conn = s;
+    $('inst').textContent = ep ? new URL(ep).host : '–';
+    paint();
+  },
+  onMsg: (d) => {
+    if (d.t === 'err') {
+      $('title').textContent = 'Order not found';
+      $('orderIdLabel').textContent = orderId || '';
+      $('connBanner').className = 'conn-banner bad';
+      $('bannerTitle').textContent = 'Order not found';
+      $('bannerSub').textContent = 'Check the order ID or place a new test order from the board.';
+      return;
+    }
+    if (d.t === 'snap') {
+      setOrder(d.order);
+      redisOk = d.redis;
+      for (const n of d.notifications || []) addNotif(n);
+      if (d.loc && d.loc.seq > lastSeq) {
+        if (!markerAnim) markerAnim = new TN.RiderMarker(d.loc.lat, d.loc.lng);
+        else markerAnim.update(d.loc.lat, d.loc.lng);
+        lastSeq = d.loc.seq; lastLocAt = Date.now();
+        trail.push([d.loc.lat, d.loc.lng]);
+      }
+      refit();
+    } else if (d.t === 'loc') {
+      if (d.seq < lastSeq) { c.send({ t: 'back' }); return; }
+      if (d.seq === lastSeq) return;
+      lastSeq = d.seq; lastLocAt = Date.now();
+      if (!markerAnim) markerAnim = new TN.RiderMarker(d.lat, d.lng);
+      else markerAnim.update(d.lat, d.lng);
+      trail.push([d.lat, d.lng]);
+      if (trail.length > 300) trail.shift();
+      if (++shown % 5 === 0) c.send({ t: 'lat', ms: Date.now() - d.ts });
+    } else if (d.t === 'notify') {
+      const isNew = addNotif({ version: d.v, status: d.s, delivered_at: d.at });
+      if (!isNew) c.send({ t: 'dup' });
+      fetch('/api/orders/' + orderId).then((r) => r.json()).then((j) => j.order && setOrder(j.order)).catch(() => {});
+    } else if (d.t === 'hb') {
+      redisOk = d.redis;
+      const rc = $('cRedis');
+      rc.style.display = '';
+      rc.className = 'chip ' + (redisOk ? 'ok' : 'bad');
+      rc.querySelector('b').textContent = redisOk ? 'Redis OK' : 'Redis down';
+    }
+    paint();
+  }
+});
+</script></body></html>

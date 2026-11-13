@@ -1,0 +1,71 @@
+version: '3.9'
+
+services:
+  redis:
+    image: redis:7-alpine
+    command: redis-server --maxmemory 512mb --maxmemory-policy allkeys-lru --save ""
+    ports:
+      - "6379:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 3s
+      timeout: 2s
+      retries: 5
+
+  app1:
+    build: .
+    environment:
+      PORT: "3001"
+      INSTANCE_ID: app1
+      REDIS_URL: redis://redis:6379
+      PEERS: "http://app1:3001,http://app2:3002"
+      DB_PATH: /data/tracknow.db
+    volumes:
+      - tracknow-data:/data
+    depends_on:
+      redis:
+        condition: service_healthy
+    restart: unless-stopped
+
+  app2:
+    build: .
+    environment:
+      PORT: "3002"
+      INSTANCE_ID: app2
+      REDIS_URL: redis://redis:6379
+      PEERS: "http://app1:3001,http://app2:3002"
+      DB_PATH: /data/tracknow.db
+    volumes:
+      - tracknow-data:/data
+    depends_on:
+      redis:
+        condition: service_healthy
+    restart: unless-stopped
+
+  worker:
+    build: .
+    command: ["node", "--no-warnings", "src/worker.js"]
+    environment:
+      REDIS_URL: redis://redis:6379
+      DB_PATH: /data/tracknow.db
+    volumes:
+      - tracknow-data:/data
+    depends_on:
+      redis:
+        condition: service_healthy
+    restart: unless-stopped
+
+  haproxy:
+    image: haproxy:2.9-alpine
+    ports:
+      - "8080:8080"
+      - "8404:8404"   # HAProxy stats page
+    volumes:
+      - ./infra/haproxy.cfg:/usr/local/etc/haproxy/haproxy.cfg:ro
+    depends_on:
+      - app1
+      - app2
+    restart: unless-stopped
+
+volumes:
+  tracknow-data:

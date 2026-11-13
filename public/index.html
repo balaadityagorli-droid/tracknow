@@ -1,0 +1,424 @@
+<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>TrackNow · Dispatch Dashboard</title><link rel="stylesheet" href="style.css"></head>
+<body>
+<div class="bar">
+  <h1>TrackNow <span class="sub">Dispatch Operations Dashboard</span></h1>
+  <div class="chips">
+    <span class="chip" id="cConn"><i></i><b>Connecting…</b></span>
+    <span class="chip" id="cRedis"><i></i><b>Redis</b></span>
+    <span class="chip" id="cWorker"><i></i><b>Notifier</b></span>
+    <a class="chip" href="board.html" target="_blank">🍴 Restaurant board</a>
+    <a class="chip" href="track.html" target="_blank">📦 Track order</a>
+  </div>
+</div>
+<div class="ops">
+  <section class="proof">
+    <header>
+      <h2>Live proof board</h2>
+      <div class="tally" id="tally">Waiting for data…</div>
+    </header>
+    <div id="rows"></div>
+  </section>
+  <div class="stage">
+    <div class="mapwrap">
+      <canvas id="map"></canvas>
+      <div class="maptools">
+        <label><span class="dot" style="background:var(--teal)"></span><input type="checkbox" id="fAvail" checked> Available</label>
+        <label><span class="dot" style="background:var(--indigo)"></span><input type="checkbox" id="fBusy" checked> Delivering</label>
+        <label><span class="dot" style="background:var(--grey)"></span><input type="checkbox" id="fOld" checked> Stale</label>
+        <span id="rcount" class="num" style="color:var(--muted);margin-left:4px"></span>
+      </div>
+      <div class="maptools" style="left:auto;right:14px;gap:5px">
+        <button class="btn" id="zIn" style="padding:3px 9px;font-weight:700" title="Zoom in">+</button>
+        <button class="btn" id="zOut" style="padding:3px 9px;font-weight:700" title="Zoom out">−</button>
+        <button class="btn" id="zFit" style="padding:3px 9px" title="Fit Hyderabad">⛶ Fit</button>
+      </div>
+      <!-- Hover Tooltip -->
+      <div id="mapTooltip" style="position:absolute;pointer-events:none;display:none;background:rgba(23,38,43,0.92);color:#fff;padding:6px 10px;border-radius:6px;font-size:12px;box-shadow:0 3px 10px rgba(0,0,0,0.25);z-index:6"></div>
+      <div class="banner" id="banner"></div>
+    </div>
+    <div class="under">
+      <div class="controls">
+        <h3>Chaos controls — make it fail</h3>
+        <div class="group">
+          <span>Bad GPS (requires rider simulator on :4200)</span>
+          <div class="btns">
+            <button class="btn" data-sim="dup">Duplicate GPS</button>
+            <button class="btn" data-sim="late">Out-of-order GPS</button>
+            <button class="btn" data-sim="oldts">Old-clock GPS</button>
+            <button class="btn" data-sim="burst">GPS burst (×20)</button>
+            <button class="btn" data-sim="offline">Take 50 riders offline</button>
+          </div>
+        </div>
+        <div class="group">
+          <span>Competing assignments (atomic claim test)</span>
+          <div class="btns">
+            <button class="btn" id="raceS">Race: 2 orders, 1 rider</button>
+            <button class="btn" id="raceB">Race: 2 batches, 1 rider</button>
+            <button class="btn" id="newOrder">Place + assign order</button>
+          </div>
+        </div>
+        <div class="group">
+          <span>Exactly-once notifications (outbox test)</span>
+          <div class="btns">
+            <button class="btn" id="pause">Pause notifier</button>
+            <button class="btn" id="redeliver">Replay last 3 events</button>
+          </div>
+        </div>
+        <div class="group">
+          <span>Infrastructure failure</span>
+          <div class="btns">
+            <button class="btn danger" id="redis">Interrupt Redis 15 s</button>
+            <button class="btn danger" data-kill="0">Stop instance 1</button>
+            <button class="btn danger" data-kill="1">Stop instance 2</button>
+            <button class="btn" id="reset">Reset demo data</button>
+          </div>
+        </div>
+        <div class="log" id="log" role="status" aria-live="polite"></div>
+      </div>
+      <div class="orders">
+        <h3>Latest orders <span id="orderCount" style="color:var(--muted);font-weight:400;font-size:12.5px"></span></h3>
+        <ul id="orders"></ul>
+      </div>
+    </div>
+  </div>
+</div>
+<script src="common.js"></script>
+<script>
+const $ = (id) => document.getElementById(id);
+const riders = new Map(), orders = new Map();
+let M = null, peers = [], fitted = false;
+let hoveredRider = null;
+
+// ---- canvas ops map ----
+const map = new TN.MapView($('map'), { draw(x, p) {
+  const now = Date.now();
+  const A = $('fAvail').checked, B = $('fBusy').checked, O = $('fOld').checked;
+  let nAvail = 0, nBusy = 0, nStale = 0;
+  const zoom = map.zoom;
+
+  for (const [id, r] of riders) {
+    const busy = r.st === 'busy';
+    const old = now - r.ts > 10000;
+    if (old) { nStale++; if (!O) continue; }
+    else if (busy) { nBusy++; if (!B) continue; }
+    else { nAvail++; if (!A) continue; }
+
+    const [px, py] = p(r.lat, r.lng);
+    if (px < -15 || py < -15 || px > map.w + 15 || py > map.h + 15) continue;
+
+    if (busy) {
+      // Delivering rider: prominent indigo badge with pulse
+      const pulse = (now % 1200) / 1200;
+      x.beginPath();
+      x.arc(px, py, 9 + pulse * 7, 0, 6.3);
+      x.fillStyle = 'rgba(63, 61, 184, ' + (0.35 - pulse * 0.3) + ')';
+      x.fill();
+
+      x.beginPath();
+      x.arc(px, py, 6, 0, 6.3);
+      x.fillStyle = '#3f3db8';
+      x.fill();
+      x.strokeStyle = '#ffffff';
+      x.lineWidth = 2;
+      x.stroke();
+
+      if (zoom >= 13.5) {
+        x.font = 'bold 10px system-ui, sans-serif';
+        x.fillStyle = '#3f3db8';
+        x.textAlign = 'center';
+        x.fillText(`🛵 ${id}`, px, py - 10);
+      }
+    } else if (old) {
+      // Stale rider: muted grey
+      x.beginPath();
+      x.arc(px, py, 3, 0, 6.3);
+      x.fillStyle = '#8b9a9f';
+      x.fill();
+    } else {
+      // Available rider: crisp emerald teal dot with white center
+      x.beginPath();
+      x.arc(px, py, 4, 0, 6.3);
+      x.fillStyle = '#0b7a75';
+      x.fill();
+      x.strokeStyle = '#ffffff';
+      x.lineWidth = 1.2;
+      x.stroke();
+    }
+  }
+
+  // Draw hover highlight if active
+  if (hoveredRider) {
+    const [hx, hy] = p(hoveredRider.lat, hoveredRider.lng);
+    x.beginPath();
+    x.arc(hx, hy, 12, 0, 6.3);
+    x.strokeStyle = '#ffb703';
+    x.lineWidth = 2.5;
+    x.stroke();
+  }
+
+  const total = nAvail + nBusy + nStale;
+  $('rcount').textContent = total > 0
+    ? `${total.toLocaleString()} riders · ${nAvail} avail · ${nBusy} busy`
+    : 'No riders active yet';
+} });
+
+// Hover inspection
+$('map').addEventListener('pointermove', (e) => {
+  const rect = $('map').getBoundingClientRect();
+  const mx = e.clientX - rect.left, my = e.clientY - rect.top;
+  const now = Date.now();
+  let closest = null, minD = 18;
+
+  for (const [id, r] of riders) {
+    const [px, py] = map.project(r.lat, r.lng);
+    const d = Math.hypot(px - mx, py - my);
+    if (d < minD) {
+      minD = d;
+      closest = { id, ...r };
+    }
+  }
+
+  hoveredRider = closest;
+  const tip = $('mapTooltip');
+  if (closest) {
+    tip.style.display = 'block';
+    tip.style.left = (mx + 12) + 'px';
+    tip.style.top = (my - 12) + 'px';
+    tip.innerHTML = `<b>🛵 ${closest.id}</b> · ${closest.st || 'available'}<br><span style="color:#cbd6d4">${closest.lat.toFixed(4)}, ${closest.lng.toFixed(4)}</span>`;
+  } else {
+    tip.style.display = 'none';
+  }
+  map.dirty = true;
+});
+
+$('map').addEventListener('pointerleave', () => {
+  hoveredRider = null;
+  $('mapTooltip').style.display = 'none';
+  map.dirty = true;
+});
+
+function fitHyderabad() {
+  map.fit([[17.34, 78.33], [17.51, 78.56]], 60);
+}
+
+$('zIn').onclick = () => map.zoomIn();
+$('zOut').onclick = () => map.zoomOut();
+$('zFit').onclick = () => fitHyderabad();
+
+map.onresize = () => {
+  if (!fitted && map.w) {
+    fitHyderabad();
+    fitted = true;
+  }
+};
+// Bootstrap: ResizeObserver fires before onresize is wired — trigger fit explicitly
+setTimeout(() => { if (!fitted && map.w) { fitHyderabad(); fitted = true; } else if (!fitted) { map.resize(); } }, 50);
+setTimeout(() => { if (!fitted) { fitHyderabad(); fitted = true; } }, 300);
+setInterval(() => (map.dirty = true), 500);
+['fAvail', 'fBusy', 'fOld'].forEach((i) => $(i).addEventListener('change', () => (map.dirty = true)));
+
+// ---- proof rows ----
+const fmt = (n) => Number(n).toLocaleString(undefined, { maximumFractionDigits: 0 });
+const fms = (v) => v == null ? '–' : (v >= 2000 ? '≥' : '≤') + fmt(v) + ' ms';
+function buildRows(m) {
+  const t = m.totals, L = m.latency, inv = m.inv, N = m.notif;
+  const up = m.instances.filter((i) => i.up);
+  const R = [];
+  const act = m.riders.active, rate = m.rates.loc_in;
+  R.push({ name: 'Riders reporting live', val: `${fmt(act)} riders · ${fmt(rate)}/s`, target: '2,000 riders @ 1 update/s',
+    detail: `Riders heard from in the last 5 s. Accepted location updates/s across all instances.`,
+    state: act === 0 ? 'none' : act >= 2000 && rate >= 1900 ? 'pass' : 'partial' });
+
+  const vt = m.viewers.total, withViewers = m.instances.filter((i) => i.up && i.viewers > 0).length;
+  R.push({ name: 'Customers tracking live', val: `${fmt(vt)} on ${withViewers}/${m.instances.length} instances`, target: '2,000+ viewers across 2+ instances',
+    detail: m.instances.map((i) => `${i.id}: ${fmt(i.viewers)} viewers${i.up ? '' : ' (DOWN)'}`).join(' · ') || 'No instances.',
+    state: vt === 0 ? 'none' : vt >= 2000 && withViewers >= 2 ? 'pass' : 'partial' });
+
+  R.push({ name: 'Map update latency p95', val: fms(L.delivery_p95), target: '< 2,000 ms',
+    detail: `Rider GPS send → customer map render, sampled from ${fmt(L.delivery_n)} viewer messages.`,
+    state: L.delivery_n < 20 ? 'none' : L.delivery_p95 < 2000 ? 'pass' : 'fail' });
+
+  const polls = t.polling_requests || 0;
+  R.push({ name: 'HTTP polling requests (must be zero)', val: fmt(polls), target: 'zero',
+    detail: 'GET /api/track/* is refused HTTP 426. Any value > 0 means a client is polling instead of using WebSocket.',
+    state: vt === 0 ? 'none' : polls === 0 ? 'pass' : 'fail' });
+
+  R.push({ name: 'Database location writes/s', val: `${m.rates.db_loc_writes.toFixed(1)}/s`, target: '< 50/s',
+    detail: `${fmt(t.db_loc_writes || 0)} total rows. Latest position lives in Redis; history is 1 row per rider per 90 s.`,
+    state: act === 0 ? 'none' : m.rates.db_loc_writes < 50 ? 'pass' : 'fail' });
+
+  R.push({ name: 'Nearest-rider search p95', val: fms(L.search_p95), target: '< 50 ms',
+    detail: `${fmt(L.search_n)} GEOSEARCH calls · full assignment p95 ${fms(L.assign_p95)}.`,
+    state: L.search_n < 5 ? 'none' : L.search_p95 < 50 ? 'pass' : 'fail' });
+
+  const rsv = t.race_single_violations || 0;
+  R.push({ name: 'Double assignments (must be zero)', val: `${inv.double_assign_violations + rsv} violations`, target: 'zero',
+    detail: `${fmt(t.assign_conflicts_prevented || 0)} races won atomically · ${fmt(t.race_single_trials || 0)} single-race trials · ${fmt(inv.assigned_orders)} orders assigned.`,
+    state: inv.assigned_orders === 0 ? 'none' : inv.double_assign_violations + rsv > 0 ? 'fail' : 'pass' });
+
+  const rbv = t.race_batch_violations || 0;
+  R.push({ name: 'Atomic batch assignment', val: `${inv.partial_batches + rbv} partial`, target: 'zero partial batches',
+    detail: `${fmt(inv.batches_committed)} batches committed · ${fmt(t.batch_failed_clean || 0)} refused cleanly · ${fmt(t.race_batch_trials || 0)} race trials.`,
+    state: !(t.batch_attempts) ? 'none' : inv.partial_batches + rbv > 0 ? 'fail' : 'pass' });
+
+  const nbad = inv.notif_out_of_order + inv.notif_missing + (t.notif_dup_visible || 0);
+  R.push({ name: 'Notifications: exactly-once, in order', val: `${fmt(N.processed)} sent · ${fmt(N.pending)} pending`, target: 'zero duplicates or gaps',
+    detail: `${fmt(N.dup_suppressed)} repeats suppressed · ${nbad} bad · notifier ${N.worker}.`,
+    state: N.processed === 0 && N.pending === 0 ? 'none' : nbad > 0 ? 'fail' : N.pending > 0 ? 'partial' : 'pass', label: N.pending > 0 ? 'Draining…' : null });
+
+  const back = t.marker_backwards || 0, rej = (t.loc_rejected_stale || 0);
+  R.push({ name: 'Rider marker never moves backwards', val: `${back} visible`, target: 'zero',
+    detail: `${fmt(rej)} stale/duplicate GPS samples rejected before reaching any map.`,
+    state: vt === 0 ? 'none' : back > 0 ? 'fail' : rej === 0 ? 'partial' : 'pass', label: vt > 0 && back === 0 && rej === 0 ? 'Not stress-tested' : null });
+
+  const down = m.instances.filter((i) => !i.up).map((i) => i.id);
+  R.push({ name: 'Instance failover speed', val: L.reconnect_n ? fms(L.reconnect_p95) : `${up.length}/${m.instances.length} up`, target: '< 5,000 ms',
+    detail: `${down.length ? down.join(', ') + ' DOWN · ' : ''}${fmt(t.reconnects || 0)} viewer failovers measured.`,
+    state: L.reconnect_n === 0 ? 'none' : L.reconnect_p95 < 5000 ? 'pass' : 'fail' });
+
+  const rd = m.redis, outages = t.redis_down_events || 0;
+  R.push({ name: 'Redis interruption (fail-safe + recovery)', val: rd.up && rd.ready ? 'Up & ready' : rd.chaos ? 'Chaos active' : 'Down', target: 'fail closed, then auto-recover',
+    detail: `${fmt(t.redis_refused || 0)} assignment attempts fail-closed · ${fmt(t.redis_recoveries || 0)} recoveries · ${outages} outages observed.`,
+    state: !(rd.up && rd.ready) ? 'partial' : outages > 0 ? 'pass' : 'none', label: rd.chaos ? 'Chaos injected' : !(rd.up && rd.ready) ? 'Degraded (by design)' : null });
+  return R;
+}
+
+const LABEL = { pass: 'Passing', fail: 'Failing', partial: 'Below target', none: 'Not tested yet' };
+const MARK  = { pass: '✓', fail: '✕', partial: '~', none: '·' };
+function renderProof(m) {
+  const R = buildRows(m), c = { pass: 0, fail: 0, partial: 0, none: 0 };
+  $('rows').innerHTML = R.map((r) => {
+    c[r.state]++;
+    return `<div class="row ${r.state}">
+      <div class="mark" aria-hidden="true" title="${LABEL[r.state]}">${MARK[r.state]}</div>
+      <div class="name">${r.name}</div>
+      <div class="val num">${r.val}</div>
+      <div class="detail">${r.detail}</div>
+      <div class="target"><span class="state">${r.label || LABEL[r.state]}</span> · target: ${r.target}</div>
+    </div>`;
+  }).join('');
+  $('tally').textContent =
+    `${c.pass} of ${R.length} passing · ${c.partial} below target · ${c.fail} failing · ${c.none} not tested`;
+
+  const w = m.notif.worker;
+  setChip('cWorker', w === 'up' ? 'ok' : w === 'paused' ? 'warn' : 'bad',
+    `Notifier ${w === 'up' ? 'running' : w}`);
+  setChip('cRedis', m.redis.up && m.redis.ready ? 'ok' : 'bad',
+    m.redis.chaos ? 'Redis (chaos)' : m.redis.up && m.redis.ready ? 'Redis OK' : 'Redis DOWN');
+
+  const bn = $('banner');
+  if (!(m.redis.up && m.redis.ready)) {
+    bn.textContent = m.redis.chaos ? 'Redis chaos active — assignments paused, tracking stale' : 'Redis unavailable — assignments paused';
+    bn.className = 'banner show bad';
+  } else bn.className = 'banner';
+}
+function setChip(id, cls, text) { const e = $(id); e.className = 'chip ' + cls; e.querySelector('b').textContent = text; }
+
+// ---- orders list ----
+function renderOrders() {
+  const list = [...orders.values()].sort((a, b) => b.updated_at - a.updated_at).slice(0, 10);
+  $('orderCount').textContent = `(${orders.size} total)`;
+  $('orders').innerHTML = list.length ? list.map((o) =>
+    `<li>
+      <a href="track.html?order=${o.id}" target="_blank" title="Track this order">${o.id}</a>
+      <span style="color:var(--muted);font-size:12px">${o.rider_id ? '🛵 ' + o.rider_id : '—'}</span>
+      <span class="pill s-${o.status}">${TN.STATUS[o.status]}</span>
+    </li>`
+  ).join('') : '<li style="color:var(--muted)">No orders yet. Place one to get started.</li>';
+}
+
+// ---- WebSocket connection ----
+TN.connect({ kind: 'ops',
+  onState: (s, ep) => {
+    const port = ep ? ` · :${new URL(ep).port}` : '';
+    setChip('cConn', s === 'live' ? 'ok' : s === 'offline' ? 'bad' : 'warn',
+      s === 'live' ? `Live${port}` : s === 'offline' ? 'Offline' : 'Reconnecting…');
+    // Show/hide server-not-running banner
+    const banner = $('banner');
+    if (banner) {
+      if (s === 'live') {
+        banner.style.display = 'none';
+        clearTimeout(window._bannerTimer);
+      }
+    }
+  },
+  onMsg: (d) => {
+    if (d.t === 'snap') {
+      riders.clear();
+      for (const r of d.riders || []) riders.set(r[0], { lat: r[1], lng: r[2], st: r[3], ts: r[4] });
+      orders.clear(); for (const o of d.orders || []) orders.set(o.id, o);
+      renderOrders(); map.dirty = true;
+    } else if (d.t === 'riders') {
+      for (const r of d.d) riders.set(r[0], { lat: r[1], lng: r[2], st: r[3], ts: r[4] });
+      map.dirty = true;
+    } else if (d.t === 'metrics') {
+      M = d.d; renderProof(M);
+      $('pause').textContent = M.notif.worker === 'paused' ? 'Resume notifier' : 'Pause notifier';
+    } else if (d.t === 'order') {
+      orders.set(d.order.id, d.order); renderOrders();
+    } else if (d.t === 'reset') {
+      riders.clear(); orders.clear(); renderOrders(); map.dirty = true;
+    }
+  }
+});
+TN.endpoints().then((e) => (peers = e.peers));
+
+// ---- controls ----
+const log = (t) => ($('log').textContent = t);
+async function act(btn, fn) {
+  btn && (btn.disabled = true);
+  try { log(await fn()); } catch (e) { log('⚠ ' + e.message); }
+  btn && (btn.disabled = false);
+}
+
+document.querySelectorAll('[data-sim]').forEach((b) => b.onclick = () => act(b, async () => {
+  const mode = b.dataset.sim, n = mode === 'burst' ? 20 : mode === 'offline' ? 50 : 100;
+  const r = await fetch(`http://${location.hostname}:4200/chaos`, {
+    method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ mode, n })
+  }).catch(() => null);
+  if (!r || !r.ok) throw new Error('Rider simulator not reachable on :4200. Run: node sim/riders.js --riders 2000');
+  return `✓ Injected "${mode}" chaos on ${n} riders. Watch the proof board update.`;
+}));
+
+$('raceS').onclick = (e) => act(e.target, async () => {
+  const r = (await TN.api('/api/admin/race', { kind: 'single', trials: 10 })).body;
+  return r.error ? '✕ Race refused: ' + r.error : `Race (single): ${r.exactly_one}/10 had exactly one winner, ${r.violations} violations.`;
+});
+$('raceB').onclick = (e) => act(e.target, async () => {
+  const r = (await TN.api('/api/admin/race', { kind: 'batch', trials: 10 })).body;
+  return r.error ? '✕ Race refused: ' + r.error : `Race (batch): ${r.exactly_one}/10 clean, ${r.violations} violations.`;
+});
+$('newOrder').onclick = (e) => act(e.target, async () => {
+  const lat = 17.37 + Math.random() * 0.12, lng = 78.37 + Math.random() * 0.16;
+  const c = await TN.api('/api/orders', { restaurantId: 'rest-1', customerId: 'cust-' + TN.rid(), pickup: { lat, lng }, dropoff: { lat: 17.43, lng: 78.45 } });
+  const a = await TN.api(`/api/orders/${c.body.order.id}/assign`, {});
+  return a.status === 200
+    ? `✓ Order ${c.body.order.id} → rider ${a.body.riderId}. Open "Track order" to watch it live.`
+    : `Order ${c.body.order.id} placed, assignment: ${a.body.error}.`;
+});
+$('pause').onclick = (e) => act(e.target, async () => {
+  const on = !(M && M.notif.worker === 'paused');
+  await TN.api('/api/admin/flag', { key: 'notifier_paused', value: on ? '1' : '0' });
+  return on ? '⏸ Notifier paused. Change an order status and watch "pending" grow.' : '▶ Notifier resumed. Pending events drain in order.';
+});
+$('redeliver').onclick = (e) => act(e.target, async () => {
+  const r = (await TN.api('/api/admin/redeliver', { n: 3 })).body;
+  return `Re-queued ${r.reset} sent events. Watch: they should be suppressed (exactly-once).`;
+});
+$('redis').onclick = (e) => act(e.target, async () => {
+  await TN.api('/api/admin/redis-outage', { seconds: 15 });
+  return 'Redis connections cut for 15 s on every instance. Watch: assignments pause and UI degrades gracefully.';
+});
+document.querySelectorAll('[data-kill]').forEach((b) => b.onclick = () => act(b, async () => {
+  const target = peers[+b.dataset.kill];
+  if (!target) throw new Error('Peer list unavailable — ensure both instances are running.');
+  await fetch(target + '/api/admin/kill', { method: 'POST' }).catch(() => {});
+  return `Stopped instance ${+b.dataset.kill + 1}. Watch: viewers reconnect to the other instance within 5 s.`;
+}));
+$('reset').onclick = (e) => act(e.target, async () => {
+  await TN.api('/api/admin/reset', {});
+  return '✓ Demo data cleared. All counters reset to zero.';
+});
+</script></body></html>
