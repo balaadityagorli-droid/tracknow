@@ -24,14 +24,14 @@ const TN = (() => {
       const base = ep.replace(/^http/, 'ws');
       const q = new URLSearchParams({ kind }); if (order) q.set('order', order);
       const sock = (ws = new WebSocket(`${base}/ws?${q}`));
-      sock.onopen = () => { last = Date.now(); attempt = 0; set('connecting', ep); };
+      sock.onopen = () => { last = Date.now(); attempt = 0; set('live', ep); };
       sock.onmessage = (e) => {
         last = Date.now();
         let d;
         try { d = JSON.parse(e.data); } catch (err) { return; }
+        if (state !== 'live') set('live', ep);
         if (d.t === 'snap') {
           if (closedAt) { sock.send(JSON.stringify({ t: 'reconnect', ms: Date.now() - closedAt })); closedAt = 0; }
-          set('live', ep);
         }
         onMsg(d);
       };
@@ -146,7 +146,7 @@ const TN = (() => {
         }
         requestAnimationFrame(loop);
       };
-      loop();
+      requestAnimationFrame(loop);
     }
 
     zoomIn() { this.zoom = Math.min(18, this.zoom + 0.6); this.dirty = true; }
@@ -226,7 +226,7 @@ const TN = (() => {
       this.drawRasterTiles(x);
 
       // 3. Call page-specific overlay (riders, routes, pins)
-      this.drawFn(x, (la, ln) => this.project(la, ln));
+      this.drawFn(x, (la, ln) => this.project(la, ln), this);
     }
 
     drawVectorBase(x) {
@@ -433,5 +433,38 @@ const TN = (() => {
     return `${min} min`;
   }
 
-  return { css, endpoints, connect, MapView, RiderMarker, hav, rid, STATUS, STATUS_STEPS, api, fmtDist, fmtEta };
+  // OSRM Driving Route Cache & Fetcher
+  // Cache key: startLng,startLat;endLng,endLat
+  const routeCache = new Map();
+
+  async function getRoute(startLat, startLng, endLat, endLng) {
+    const key = `${startLng.toFixed(4)},${startLat.toFixed(4)};${endLng.toFixed(4)},${endLat.toFixed(4)}`;
+    if (routeCache.has(key)) {
+      return routeCache.get(key);
+    }
+    const url = `https://router.project-osrm.org/route/v1/driving/${startLng},${startLat};${endLng},${endLat}?overview=full&geometries=geojson`;
+    try {
+      const res = await fetch(url);
+      if (!res.ok) throw new Error(`OSRM HTTP ${res.status}`);
+      const data = await res.json();
+      if (data.code !== 'Ok' || !data.routes || !data.routes.length) {
+        throw new Error(data.message || 'No route found');
+      }
+      const r = data.routes[0];
+      // OSRM coordinates are [lon, lat] -> convert to Leaflet [lat, lon]
+      const coords = r.geometry.coordinates.map(pt => [pt[1], pt[0]]);
+      const result = {
+        coordinates: coords, // Array of [lat, lng]
+        distance: r.distance, // meters
+        duration: r.duration  // seconds
+      };
+      routeCache.set(key, result);
+      return result;
+    } catch (err) {
+      console.warn('OSRM routing failed:', err.message);
+      return null;
+    }
+  }
+
+  return { css, endpoints, connect, MapView, RiderMarker, hav, rid, STATUS, STATUS_STEPS, api, fmtDist, fmtEta, getRoute };
 })();

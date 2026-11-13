@@ -9,14 +9,19 @@ function freePort(port) {
   if (process.platform === 'win32') {
     try {
       const out = execSync(`netstat -ano -p tcp | findstr :${port}`, { encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'] });
+      let killed = false;
       for (const line of out.split('\n')) {
         const parts = line.trim().split(/\s+/);
         if (parts.length >= 5 && parts[3] === 'LISTENING') {
           const pid = parts[4];
           if (pid && pid !== '0' && pid !== String(process.pid)) {
-            try { execSync(`taskkill /F /PID ${pid}`, { stdio: 'ignore' }); } catch (e) {}
+            try { execSync(`taskkill /F /PID ${pid}`, { stdio: 'ignore' }); killed = true; } catch (e) {}
           }
         }
+      }
+      if (killed) {
+        const start = Date.now();
+        while (Date.now() - start < 300) {}
       }
     } catch (e) {}
   } else {
@@ -30,9 +35,10 @@ function startStack(o = {}) {
   const ports = o.ports || [3001, 3002];
   const useMini = o.miniRedis !== false;
   const redisPort = o.redisPort || (useMini ? 6390 : 6379);
+  const withSim = o.withSim || process.argv.includes('--sim') || process.argv.includes('--with-riders');
 
   // Pre-flight: free ports if occupied by leftover zombie processes
-  [redisPort, ...ports].forEach(freePort);
+  [redisPort, ...ports, 4200].forEach(freePort);
 
   const env = {
     ...process.env,
@@ -44,17 +50,29 @@ function startStack(o = {}) {
 
   const defs = [];
   if (useMini) {
-    defs.push({ name: 'redis', cmd: process.execPath, args: [path.join(__dirname, 'miniredis.js'), String(redisPort)], env });
+    defs.push({ name: 'redis', cmd: process.execPath, args: [path.join(__dirname, 'miniredis.js'), String(redisPort)], env, port: redisPort });
   }
   ports.forEach((p, i) => {
     defs.push({
       name: `app${i + 1}`,
       cmd: process.execPath,
       args: ['--no-warnings', path.join(root, 'src', 'server.js')],
-      env: { ...env, PORT: String(p), INSTANCE_ID: `app${i + 1}` }
+      env: { ...env, PORT: String(p), INSTANCE_ID: `app${i + 1}` },
+      port: p
     });
   });
   defs.push({ name: 'worker', cmd: process.execPath, args: ['--no-warnings', path.join(root, 'src', 'worker.js')], env });
+
+  if (withSim) {
+    defs.push({
+      name: 'riders',
+      cmd: process.execPath,
+      args: [path.join(root, 'sim', 'riders.js'), '--riders', '2000', '--urls', ports.map((p) => `http://localhost:${p}`).join(',')],
+      env,
+      delay: 1500,
+      port: 4200
+    });
+  }
 
   const procs = new Map();
   let stopping = false;
@@ -71,22 +89,35 @@ function startStack(o = {}) {
   };
 
   const spawnOne = (d) => {
-    const c = spawn(d.cmd, d.args, { env: d.env, stdio: ['ignore', 'pipe', 'pipe'] });
-    procs.set(d.name, c);
-    const log = (b) => {
-      if (!o.quiet) {
-        for (const l of String(b).split('\n')) {
-          if (l.trim()) console.log(`[${d.name}] ${l}`);
-        }
-      }
-    };
-    c.stdout.on('data', log);
-    c.stderr.on('data', log);
-    c.on('exit', (code) => {
+    const doSpawn = () => {
       if (stopping) return;
-      if (!o.quiet) console.log(`[${d.name}] exited (${code}); restarting in ${o.respawnMs || 6000} ms`);
-      setTimeout(() => !stopping && spawnOne(d), o.respawnMs || 6000);
-    });
+      const c = spawn(d.cmd, d.args, { env: d.env, stdio: ['ignore', 'pipe', 'pipe'] });
+      procs.set(d.name, c);
+      const log = (b) => {
+        if (!o.quiet) {
+          for (const l of String(b).split('\n')) {
+            if (l.trim()) console.log(`[${d.name}] ${l}`);
+          }
+        }
+      };
+      c.stdout.on('data', log);
+      c.stderr.on('data', log);
+      c.on('exit', (code) => {
+        if (stopping) return;
+        if (!o.quiet) console.log(`[${d.name}] exited (${code}); restarting in ${o.respawnMs || 6000} ms`);
+        setTimeout(() => {
+          if (!stopping) {
+            if (d.port) freePort(d.port);
+            spawnOne(d);
+          }
+        }, o.respawnMs || 6000);
+      });
+    };
+    if (d.delay) {
+      setTimeout(doSpawn, d.delay);
+    } else {
+      doSpawn();
+    }
   };
 
   defs.forEach(spawnOne);

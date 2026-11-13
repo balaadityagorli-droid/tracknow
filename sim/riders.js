@@ -63,8 +63,30 @@ const chaos = { dup: 0, late: 0, oldts: 0, burst: 0 };
 const stats = { sent: 0, accepted: 0, stale: 0, rateLimited: 0, errors: 0, refused: 0 };
 let tick = 0;
 
-// Active order targets: riderId -> { status, targetLat, targetLng }
+// Active order targets: riderId -> { status, targetLat, targetLng, routeKey, coords, index }
 const activeTargets = new Map();
+const simRouteCache = new Map();
+
+async function fetchRoutePoints(startLat, startLng, endLat, endLng) {
+  const key = `${startLng.toFixed(4)},${startLat.toFixed(4)};${endLng.toFixed(4)},${endLat.toFixed(4)}`;
+  if (simRouteCache.has(key)) return simRouteCache.get(key);
+
+  const url = `https://router.project-osrm.org/route/v1/driving/${startLng},${startLat};${endLng},${endLat}?overview=full&geometries=geojson`;
+  try {
+    const res = await fetch(url);
+    if (!res.ok) return null;
+    const data = await res.json();
+    if (data.code === 'Ok' && data.routes && data.routes[0]) {
+      // OSRM coordinates are [lon, lat] -> convert to [lat, lon]
+      const pts = data.routes[0].geometry.coordinates.map(pt => [pt[1], pt[0]]);
+      simRouteCache.set(key, pts);
+      return pts;
+    }
+  } catch (e) {
+    // Graceful fallback: null if OSRM is unreachable
+  }
+  return null;
+}
 
 async function pollActiveOrders() {
   for (const base of URLS) {
@@ -77,20 +99,49 @@ async function pollActiveOrders() {
           for (const o of data.orders) {
             if (!o.rider_id) continue;
             seen.add(o.rider_id);
+
+            let targetLat, targetLng, phase;
             if (o.status === 'placed' || o.status === 'accepted' || o.status === 'preparing') {
-              activeTargets.set(o.rider_id, {
-                status: o.status,
-                targetLat: o.pickup_lat,
-                targetLng: o.pickup_lng
-              });
+              phase = 'to_pickup';
+              targetLat = o.pickup_lat;
+              targetLng = o.pickup_lng;
             } else if (o.status === 'picked_up') {
-              activeTargets.set(o.rider_id, {
-                status: o.status,
-                targetLat: o.drop_lat,
-                targetLng: o.drop_lng
-              });
+              phase = 'to_dropoff';
+              targetLat = o.drop_lat;
+              targetLng = o.drop_lng;
             } else {
               activeTargets.delete(o.rider_id);
+              continue;
+            }
+
+            const existing = activeTargets.get(o.rider_id);
+            const routeKey = `${phase}:${targetLat},${targetLng}`;
+
+            if (!existing || existing.routeKey !== routeKey) {
+              const r = riderMap.get(o.rider_id);
+              const startLat = r ? r.lat : (phase === 'to_pickup' ? targetLat - 0.01 : o.pickup_lat);
+              const startLng = r ? r.lng : (phase === 'to_pickup' ? targetLng - 0.01 : o.pickup_lng);
+
+              const entry = {
+                status: o.status,
+                phase,
+                targetLat,
+                targetLng,
+                routeKey,
+                coords: null,
+                index: 0
+              };
+              activeTargets.set(o.rider_id, entry);
+
+              // Asynchronously query road route once for this active assignment and cache it
+              fetchRoutePoints(startLat, startLng, targetLat, targetLng).then(pts => {
+                if (pts && pts.length >= 2) {
+                  entry.coords = pts;
+                  entry.index = 0;
+                }
+              });
+            } else {
+              existing.status = o.status;
             }
           }
           for (const rid of activeTargets.keys()) {
@@ -102,28 +153,61 @@ async function pollActiveOrders() {
     } catch (e) {}
   }
 }
-setInterval(pollActiveOrders, 2500).unref();
+setInterval(pollActiveOrders, 2000).unref();
 
 function step(r) {
   r.prev = { lat: r.lat, lng: r.lng };
   const target = activeTargets.get(r.id);
 
   if (target) {
-    // Rider is assigned to an order: steer directly towards the order target!
-    const dLat = target.targetLat - r.lat;
-    const dLng = target.targetLng - r.lng;
-    const dist = Math.sqrt(dLat * dLat + dLng * dLng);
+    // Rider is assigned to an order: follow OSRM road geometry if available!
+    if (target.coords && target.coords.length >= 2) {
+      const coords = target.coords;
+      let idx = target.index;
 
-    if (dist > 0.0003) {
-      // Move towards target (~35 km/h ≈ 0.00009 deg/sec)
-      r.hdg = Math.atan2(dLng, dLat);
-      const stepDist = Math.min(dist, 0.00010);
-      r.lat += Math.cos(r.hdg) * stepDist;
-      r.lng += Math.sin(r.hdg) * stepDist;
+      if (idx < coords.length - 1) {
+        const nextPt = coords[idx + 1];
+        const dLat = nextPt[0] - r.lat;
+        const dLng = nextPt[1] - r.lng;
+        const dist = Math.sqrt(dLat * dLat + dLng * dLng);
+
+        // Step distance per second (approx 35 km/h ≈ 0.00010 deg/sec)
+        const stepDist = 0.00010;
+        if (dist <= stepDist) {
+          // Arrived at current road waypoint -> advance to next
+          r.lat = nextPt[0];
+          r.lng = nextPt[1];
+          target.index = idx + 1;
+          if (idx + 2 < coords.length) {
+            r.hdg = Math.atan2(coords[idx + 2][1] - r.lng, coords[idx + 2][0] - r.lat);
+          }
+        } else {
+          // Move along road segment towards waypoint
+          r.hdg = Math.atan2(dLng, dLat);
+          r.lat += Math.cos(r.hdg) * stepDist;
+          r.lng += Math.sin(r.hdg) * stepDist;
+        }
+      } else {
+        // Holding position at destination
+        const lastPt = coords[coords.length - 1];
+        r.lat = lastPt[0];
+        r.lng = lastPt[1];
+      }
     } else {
-      // Holding position at destination
-      r.lat = target.targetLat;
-      r.lng = target.targetLng;
+      // Fallback while road route is loading or if OSRM was unreachable
+      const dLat = target.targetLat - r.lat;
+      const dLng = target.targetLng - r.lng;
+      const dist = Math.sqrt(dLat * dLat + dLng * dLng);
+
+      if (dist > 0.0002) {
+        r.hdg = Math.atan2(dLng, dLat);
+        const stepDist = Math.min(dist, 0.00010);
+        r.lat += Math.cos(r.hdg) * stepDist;
+        r.lng += Math.sin(r.hdg) * stepDist;
+      } else {
+        r.lat = target.targetLat;
+        r.lng = target.targetLng;
+      }
     }
   } else {
     // Unassigned rider cruising along local neighborhood road network

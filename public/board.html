@@ -127,25 +127,25 @@ function triggerAutoPilot(orderId, currentStatus) {
     // 1. Immediately auto-assign rider if not assigned
     if (!o.rider_id) {
       assignRider(orderId).then(() => {
-        startCountdown(orderId, '🍳 Kitchen cooking food', 4, () => {
+        startCountdown(orderId, '🍳 Kitchen cooking food', 8, () => {
           move(orderId, 'preparing');
         });
       });
     } else {
-      startCountdown(orderId, '🍳 Kitchen cooking food', 4, () => {
+      startCountdown(orderId, '🍳 Kitchen cooking food', 8, () => {
         move(orderId, 'preparing');
       });
     }
   } else if (currentStatus === 'preparing') {
     // 2. Preparing -> packaging and hand to rider (4s)
-    startCountdown(orderId, '📦 Packaging for rider', 4, async () => {
+    startCountdown(orderId, '📦 Packaging for rider', 5, async () => {
       const cur = orders.get(orderId);
       if (cur && !cur.rider_id) await assignRider(orderId);
       move(orderId, 'picked_up');
     });
   } else if (currentStatus === 'picked_up') {
     // 3. Out for delivery -> travels to customer (8s)
-    startCountdown(orderId, '🛵 En route to customer', 8, () => {
+    startCountdown(orderId, '🛵 En route to customer', 22, () => {
       move(orderId, 'delivered');
     });
   }

@@ -1,6 +1,51 @@
 <!doctype html>
-<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>TrackNow · Live Delivery Tracking</title><link rel="stylesheet" href="style.css"></head>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>TrackNow · Live Delivery Tracking</title>
+  <link rel="stylesheet" href="style.css">
+  <link rel="stylesheet" href="leaflet.css">
+  <style>
+    #map { width: 100%; height: 100%; background: #e4ebea; }
+    .leaflet-bar { border: none !important; box-shadow: 0 2px 6px rgba(0,0,0,0.15) !important; }
+    .custom-div-pin { background: transparent; border: none; }
+    .pin-bubble {
+      display: flex; flex-direction: column; align-items: center; cursor: pointer;
+    }
+    .pin-badge {
+      padding: 4px 10px; border-radius: 999px; font-weight: 700; font-size: 11.5px;
+      color: #fff; box-shadow: 0 3px 8px rgba(0,0,0,0.22); white-space: nowrap;
+      display: flex; align-items: center; gap: 4px;
+    }
+    .pin-needle {
+      width: 0; height: 0; border-left: 5px solid transparent;
+      border-right: 5px solid transparent; border-top: 6px solid;
+    }
+    .scooter-marker {
+      width: 44px; height: 44px; position: relative; display: grid; place-items: center;
+    }
+    .scooter-pulse {
+      position: absolute; inset: 0; border-radius: 50%;
+      background: rgba(63,61,184,0.3); animation: pulse-ring 1.8s cubic-bezier(0.2,0.8,0.2,1) infinite;
+    }
+    @keyframes pulse-ring {
+      0% { transform: scale(0.6); opacity: 0.9; }
+      100% { transform: scale(1.6); opacity: 0; }
+    }
+    .scooter-circle {
+      width: 32px; height: 32px; border-radius: 50%; background: #3f3db8;
+      border: 2px solid #ffffff; box-shadow: 0 3px 10px rgba(0,0,0,0.3);
+      display: grid; place-items: center; font-size: 16px; color: #fff;
+      position: relative; z-index: 2; transition: transform 0.25s linear;
+    }
+    .scooter-tag {
+      position: absolute; top: -18px; background: rgba(23,38,43,0.92);
+      color: #fff; padding: 1px 7px; border-radius: 4px; font-size: 10px;
+      font-weight: 700; white-space: nowrap; z-index: 3;
+    }
+  </style>
+</head>
 <body>
 <div class="bar">
   <h1>TrackNow <span class="sub">Live Order Tracking</span></h1>
@@ -13,15 +58,15 @@
 </div>
 <div class="track">
   <div class="mapwrap">
-    <canvas id="map"></canvas>
+    <div id="map"></div>
     <div class="banner" id="mapBanner"></div>
-    <div class="maptools" style="right:14px;left:auto;top:14px;gap:6px">
+    <div class="maptools" style="right:14px;left:auto;top:14px;gap:6px;z-index:1000">
       <button class="btn" id="zIn" style="padding:4px 10px;font-weight:700" title="Zoom in">+</button>
       <button class="btn" id="zOut" style="padding:4px 10px;font-weight:700" title="Zoom out">−</button>
-      <button class="btn" id="recenter" style="padding:4px 10px" title="Fit route">⛶ Fit</button>
+      <button class="btn" id="recenter" style="padding:4px 10px" title="Fit route">⛶ Fit Route</button>
     </div>
     <!-- Floating Live HUD -->
-    <div id="liveHud" style="position:absolute;bottom:20px;left:20px;right:20px;max-width:420px;background:rgba(255,255,255,0.95);backdrop-filter:blur(8px);border:1px solid var(--line);border-radius:12px;padding:12px 16px;box-shadow:0 6px 20px rgba(0,0,0,0.12);display:flex;align-items:center;justify-content:space-between;gap:12px;z-index:4">
+    <div id="liveHud" style="position:absolute;bottom:20px;left:20px;right:20px;max-width:440px;background:rgba(255,255,255,0.96);backdrop-filter:blur(8px);border:1px solid var(--line);border-radius:12px;padding:12px 16px;box-shadow:0 6px 20px rgba(0,0,0,0.14);display:flex;align-items:center;justify-content:space-between;gap:12px;z-index:1000">
       <div style="display:flex;align-items:center;gap:12px">
         <div id="hudIcon" style="width:40px;height:40px;border-radius:50%;background:#f0f4fd;display:grid;place-items:center;font-size:20px;flex-shrink:0">🛵</div>
         <div>
@@ -57,7 +102,7 @@
       <dd id="rider" class="rider-id">Not assigned yet</dd>
       <dt>Status Phase</dt>
       <dd id="phaseText" style="color:var(--indigo)">Preparing</dd>
-      <dt>Distance Remaining</dt>
+      <dt>Road Distance</dt>
       <dd id="dist" class="num">–</dd>
       <dt>Estimated Arrival</dt>
       <dd id="eta" class="num">–</dd>
@@ -74,281 +119,327 @@
     </div>
   </aside>
 </div>
+
+<script src="leaflet.js"></script>
 <script src="common.js"></script>
 <script>
 const $ = (id) => document.getElementById(id);
 const orderId = new URLSearchParams(location.search).get('order');
-let order = null, markerAnim = null, trail = [], lastSeq = -1, lastLocAt = 0, lastVer = 0;
-let conn = 'connecting', redisOk = true, shown = 0, lastFrameTs = Date.now();
+let order = null, lastSeq = -1, lastLocAt = 0, lastVer = 0;
+let conn = 'connecting', redisOk = true, shown = 0;
 const feed = new Map();
 
-// Synthetic simulated progression along route if real GPS is not yet streaming
-let simPhase = 'to_pickup'; // 'to_pickup' | 'to_dropoff' | 'arrived'
-let simProgress = 0.05;
+// Initialize Leaflet Map
+const map = L.map('map', {
+  zoomControl: false,
+  attributionControl: false
+}).setView([17.435, 78.448], 13);
 
-// ---- canvas map ----
-const map = new TN.MapView($('map'), { draw(x, p) {
-  if (!order) return;
-  const pick = p(order.pickup_lat, order.pickup_lng);
-  const drop = p(order.drop_lat, order.drop_lng);
+// Real OpenStreetMap Tile Layer
+L.tileLayer('https://tile.openstreetmap.org/{z}/{x}/{y}.png', {
+  maxZoom: 19
+}).addTo(map);
 
-  // 1. Draw Delivery Route Line
-  x.lineWidth = 4;
-  x.lineCap = 'round';
-  x.lineJoin = 'round';
+// Custom Map Controls
+$('zIn').onclick = () => map.zoomIn();
+$('zOut').onclick = () => map.zoomOut();
+$('recenter').onclick = () => fitRoute();
 
-  // Planned leg: Restaurant -> Customer
-  x.strokeStyle = 'rgba(11, 122, 117, 0.45)';
-  x.setLineDash([8, 6]);
-  x.beginPath();
-  x.moveTo(pick[0], pick[1]);
-  x.lineTo(drop[0], drop[1]);
-  x.stroke();
-  x.setLineDash([]);
+// Layers & Markers
+let restaurantMarker = null;
+let customerMarker = null;
+let scooterMarker = null;
+let roadPolyline = null;
+let breadcrumbPolyline = null;
+const breadcrumbCoords = [];
 
-  // Active breadcrumb trail
-  if (trail.length > 1) {
-    x.strokeStyle = TN.css('--indigo');
-    x.lineWidth = 3;
-    x.globalAlpha = 0.55;
-    x.beginPath();
-    trail.forEach((t, i) => {
-      const q = p(t[0], t[1]);
-      i ? x.lineTo(q[0], q[1]) : x.moveTo(q[0], q[1]);
-    });
-    x.stroke();
-    x.globalAlpha = 1;
+// Route state
+let activeRoadCoords = []; // Array of [lat, lng] from OSRM
+let activeRoadDistance = 0;
+let activeRoadDuration = 0;
+let lastRouteKey = '';
+let routeLeg = ''; // 'to_pickup' or 'to_dropoff'
+
+// Fallback animation along road if GPS isn't streaming yet
+let simProgress = 0;
+let lastAnimTs = Date.now();
+let lastGpsPos = null;
+
+function createPinIcon(icon, label, color) {
+  const html = `
+    <div class="pin-bubble">
+      <div class="pin-badge" style="background:${color}">
+        <span>${icon}</span> <span>${label}</span>
+      </div>
+      <div class="pin-needle" style="border-top-color:${color}"></div>
+    </div>`;
+  return L.divIcon({
+    className: 'custom-div-pin',
+    html,
+    iconSize: [140, 36],
+    iconAnchor: [70, 36]
+  });
+}
+
+function createScooterIcon(riderId, headingDeg, isStale) {
+  const bg = isStale ? '#8b9a9f' : '#3f3db8';
+  const html = `
+    <div class="scooter-marker">
+      <div class="scooter-pulse" style="background:${isStale ? 'rgba(139,154,159,0.2)' : 'rgba(63,61,184,0.35)'}"></div>
+      <span class="scooter-tag">🛵 ${riderId}</span>
+      <div class="scooter-circle" style="background:${bg}; transform: rotate(${headingDeg}deg)">
+        ➤
+      </div>
+    </div>`;
+  return L.divIcon({
+    className: 'custom-div-pin',
+    html,
+    iconSize: [44, 44],
+    iconAnchor: [22, 22]
+  });
+}
+
+function fitRoute() {
+  const bounds = [];
+  if (restaurantMarker) bounds.push(restaurantMarker.getLatLng());
+  if (customerMarker) bounds.push(customerMarker.getLatLng());
+  if (scooterMarker) bounds.push(scooterMarker.getLatLng());
+  if (roadPolyline && roadPolyline.getLatLngs().length) {
+    map.fitBounds(roadPolyline.getBounds(), { padding: [60, 60], maxZoom: 16 });
+  } else if (bounds.length) {
+    map.fitBounds(L.latLngBounds(bounds), { padding: [60, 60], maxZoom: 16 });
+  }
+}
+
+async function updateRoadRoute(startLat, startLng, endLat, endLng, legName) {
+  const key = `${legName}:${startLat.toFixed(4)},${startLng.toFixed(4)}->${endLat.toFixed(4)},${endLng.toFixed(4)}`;
+  if (key === lastRouteKey) return;
+  lastRouteKey = key;
+  routeLeg = legName;
+
+  const banner = $('mapBanner');
+  const route = await TN.getRoute(startLat, startLng, endLat, endLng);
+  if (!route) {
+    // Show route-unavailable message
+    if (banner) {
+      banner.textContent = '⚠ Road route unavailable from OSRM router. Retrying...';
+      banner.className = 'banner show bad';
+    }
+    if (roadPolyline) {
+      map.removeLayer(roadPolyline);
+      roadPolyline = null;
+    }
+    activeRoadCoords = [];
+    return;
   }
 
-  // 2. Draw 3D Restaurant Pin
-  drawPin(x, pick[0], pick[1], '#e07a16', '🍴', 'Restaurant (Pickup)');
+  if (banner) {
+    banner.className = 'banner';
+  }
 
-  // 3. Draw 3D Customer Home Pin
-  drawPin(x, drop[0], drop[1], '#0b7a75', '🏠', 'Delivery Address (You)');
+  activeRoadCoords = route.coordinates;
+  activeRoadDistance = route.distance;
+  activeRoadDuration = route.duration;
+  simProgress = 0; // reset progression for new leg
 
-  // 4. Update & Draw Synchronized Rider Scooter
-  const now = Date.now(), dt = now - lastFrameTs;
-  lastFrameTs = now;
+  // Draw Leaflet road polyline
+  if (roadPolyline) map.removeLayer(roadPolyline);
+  roadPolyline = L.polyline(activeRoadCoords, {
+    color: '#0b7a75',
+    weight: 5,
+    opacity: 0.85,
+    lineCap: 'round',
+    lineJoin: 'round',
+    dashArray: legName === 'to_pickup' ? '8, 8' : null
+  }).addTo(map);
 
-  // Compute rider position:
-  // If order status is accepted/preparing: rider heads to restaurant!
-  // If order status is picked_up: rider heads from restaurant to customer!
-  // If delivered: rider is at customer!
-  let rlat, rlng, headingAngle = 0;
+  fitRoute();
+}
 
-  if (markerAnim) {
-    markerAnim.tick(dt);
-    [rlat, rlng] = markerAnim.pos();
-    headingAngle = markerAnim.heading();
-  } else if (order.rider_id) {
-    // Generate initial position nearby if no GPS arrived yet
-    if (order.status === 'picked_up') {
-      simProgress = Math.min(0.98, simProgress + (dt / 25000));
-      rlat = order.pickup_lat + (order.drop_lat - order.pickup_lat) * simProgress;
-      rlng = order.pickup_lng + (order.drop_lng - order.pickup_lng) * simProgress;
-      headingAngle = Math.atan2(order.drop_lng - order.pickup_lng, order.drop_lat - order.pickup_lat);
-    } else if (order.status === 'delivered') {
-      rlat = order.drop_lat;
-      rlng = order.drop_lng;
+function updateScooter(lat, lng, headingDeg) {
+  const isStale = lastLocAt > 0 && (Date.now() - lastLocAt) > 6000;
+  const icon = createScooterIcon(order?.rider_id || 'Rider', Math.round(headingDeg), isStale);
+  if (!scooterMarker) {
+    scooterMarker = L.marker([lat, lng], { icon, zIndexOffset: 1000 }).addTo(map);
+  } else {
+    scooterMarker.setLatLng([lat, lng]);
+    scooterMarker.setIcon(icon);
+  }
+
+  // Record breadcrumb
+  breadcrumbCoords.push([lat, lng]);
+  if (breadcrumbCoords.length > 250) breadcrumbCoords.shift();
+  if (!breadcrumbPolyline) {
+    breadcrumbPolyline = L.polyline(breadcrumbCoords, {
+      color: '#3f3db8',
+      weight: 3,
+      opacity: 0.5
+    }).addTo(map);
+  } else {
+    breadcrumbPolyline.setLatLngs(breadcrumbCoords);
+  }
+}
+
+// Animation loop along OSRM road geometry
+function animLoop() {
+  const now = Date.now();
+  const dt = (now - lastAnimTs) / 1000;
+  lastAnimTs = now;
+
+  // If real GPS was received within last 3.5s, real GPS owns scooter position!
+  const hasRealGps = lastGpsPos && (now - lastLocAt < 3500);
+
+  if (hasRealGps) {
+    updateScooter(lastGpsPos.lat, lastGpsPos.lng, lastGpsPos.hdg || 0);
+  } else if (order && order.rider_id && activeRoadCoords.length >= 2) {
+    // Animate smoothly along road geometry
+    if (order.status === 'delivered') {
+      const lastPt = activeRoadCoords[activeRoadCoords.length - 1];
+      updateScooter(lastPt[0], lastPt[1], 0);
     } else {
-      // heading to restaurant
-      simProgress = Math.min(0.95, simProgress + (dt / 20000));
-      const startLat = order.pickup_lat - 0.008, startLng = order.pickup_lng - 0.008;
-      rlat = startLat + (order.pickup_lat - startLat) * simProgress;
-      rlng = startLng + (order.pickup_lng - startLng) * simProgress;
-      headingAngle = Math.atan2(order.pickup_lng - startLng, order.pickup_lat - startLat);
+      // Step along road (approx 35 km/h -> ~9.7 m/s)
+      const totalLen = activeRoadDistance || 1000;
+      const speedMs = 12; // 12 m/s
+      simProgress = Math.min(0.999, simProgress + (speedMs * dt) / totalLen);
+
+      // Compute exact position along polyline
+      const pos = getPointAlongCoords(activeRoadCoords, simProgress);
+      updateScooter(pos.lat, pos.lng, pos.hdg);
     }
   }
 
-  if (rlat && rlng) {
-    const q = p(rlat, rlng);
-    const isStale = lastLocAt > 0 && now - lastLocAt > 6000;
-    drawScooter(x, q[0], q[1], headingAngle, order.rider_id || 'Rider', isStale);
+  requestAnimationFrame(animLoop);
+}
+requestAnimationFrame(animLoop);
+
+function getPointAlongCoords(coords, fraction) {
+  if (coords.length === 0) return { lat: 0, lng: 0, hdg: 0 };
+  if (coords.length === 1 || fraction <= 0) return { lat: coords[0][0], lng: coords[0][1], hdg: 0 };
+  if (fraction >= 1) {
+    const p1 = coords[coords.length - 2], p2 = coords[coords.length - 1];
+    const hdg = calcHeading(p1[0], p1[1], p2[0], p2[1]);
+    return { lat: p2[0], lng: p2[1], hdg };
   }
-} });
 
-function drawPin(x, px, py, color, icon, label) {
-  // Shadow
-  x.beginPath();
-  x.ellipse(px, py + 4, 12, 5, 0, 0, 6.3);
-  x.fillStyle = 'rgba(0,0,0,0.2)';
-  x.fill();
-
-  // Pin circle
-  x.beginPath();
-  x.arc(px, py - 18, 14, 0, 6.3);
-  x.fillStyle = color;
-  x.fill();
-  x.strokeStyle = '#fff';
-  x.lineWidth = 2.5;
-  x.stroke();
-
-  // Pointer tip
-  x.beginPath();
-  x.moveTo(px - 6, py - 8);
-  x.lineTo(px, py);
-  x.lineTo(px + 6, py - 8);
-  x.fillStyle = color;
-  x.fill();
-
-  // Icon
-  x.font = '13px sans-serif';
-  x.textAlign = 'center';
-  x.textBaseline = 'middle';
-  x.fillStyle = '#fff';
-  x.fillText(icon, px, py - 18);
-
-  // Label badge
-  x.font = 'bold 11px system-ui, sans-serif';
-  x.textBaseline = 'alphabetic';
-  const tw = x.measureText(label).width;
-  x.fillStyle = 'rgba(255,255,255,0.95)';
-  x.fillRect(px - tw / 2 - 6, py + 8, tw + 12, 18);
-  x.strokeStyle = color;
-  x.lineWidth = 1;
-  x.strokeRect(px - tw / 2 - 6, py + 8, tw + 12, 18);
-  x.fillStyle = '#17262b';
-  x.fillText(label, px, py + 21);
-}
-
-function drawScooter(x, px, py, heading, riderId, isStale) {
-  x.save();
-  x.translate(px, py);
-
-  // Pulsing sonar ring
-  const pulse = (Date.now() % 1600) / 1600;
-  x.beginPath();
-  x.arc(0, 0, 16 + pulse * 14, 0, 6.3);
-  x.fillStyle = isStale ? 'rgba(139,154,159,0.15)' : 'rgba(63,61,184,' + (0.35 - pulse * 0.3) + ')';
-  x.fill();
-
-  // Base shadow
-  x.beginPath();
-  x.ellipse(0, 2, 13, 6, 0, 0, 6.3);
-  x.fillStyle = 'rgba(0,0,0,0.28)';
-  x.fill();
-
-  // Scooter badge
-  x.beginPath();
-  x.arc(0, 0, 14, 0, 6.3);
-  x.fillStyle = isStale ? '#8b9a9f' : '#3f3db8';
-  x.fill();
-  x.strokeStyle = '#ffffff';
-  x.lineWidth = 2.5;
-  x.stroke();
-
-  // Scooter icon
-  x.font = '14px sans-serif';
-  x.textAlign = 'center';
-  x.textBaseline = 'middle';
-  x.fillText('🛵', 0, 1);
-
-  // Overhead speech bubble with Rider ID
-  x.font = 'bold 11px system-ui, sans-serif';
-  x.textBaseline = 'alphabetic';
-  const tag = `🛵 ${riderId}`;
-  const tw = x.measureText(tag).width;
-  x.fillStyle = '#17262b';
-  x.fillRect(-tw / 2 - 5, -28, tw + 10, 16);
-  x.fillStyle = '#ffffff';
-  x.fillText(tag, 0, -16);
-
-  x.restore();
-}
-
-function refit() {
-  if (!order) return;
-  const pts = [[order.pickup_lat, order.pickup_lng], [order.drop_lat, order.drop_lng]];
-  if (markerAnim) {
-    const [a, b] = markerAnim.pos();
-    pts.push([a, b]);
+  // Calculate cumulative segment distances
+  let totalD = 0;
+  const dists = [];
+  for (let i = 0; i < coords.length - 1; i++) {
+    const d = TN.hav(coords[i][0], coords[i][1], coords[i+1][0], coords[i+1][1]);
+    dists.push(d);
+    totalD += d;
   }
-  map.fit(pts, 90);
+
+  const targetD = totalD * fraction;
+  let accum = 0;
+  for (let i = 0; i < dists.length; i++) {
+    if (accum + dists[i] >= targetD) {
+      const segFrac = dists[i] === 0 ? 0 : (targetD - accum) / dists[i];
+      const p1 = coords[i], p2 = coords[i+1];
+      const lat = p1[0] + (p2[0] - p1[0]) * segFrac;
+      const lng = p1[1] + (p2[1] - p1[1]) * segFrac;
+      const hdg = calcHeading(p1[0], p1[1], p2[0], p2[1]);
+      return { lat, lng, hdg };
+    }
+    accum += dists[i];
+  }
+  const last = coords[coords.length - 1];
+  return { lat: last[0], lng: last[1], hdg: 0 };
 }
 
-$('zIn').onclick = () => map.zoomIn();
-$('zOut').onclick = () => map.zoomOut();
-$('recenter').onclick = () => refit();
+function calcHeading(lat1, lon1, lat2, lon2) {
+  const dLon = (lon2 - lon1) * Math.PI / 180;
+  const y = Math.sin(dLon) * Math.cos(lat2 * Math.PI / 180);
+  const x = Math.cos(lat1 * Math.PI / 180) * Math.sin(lat2 * Math.PI / 180) -
+            Math.sin(lat1 * Math.PI / 180) * Math.cos(lat2 * Math.PI / 180) * Math.cos(dLon);
+  return (Math.atan2(y, x) * 180 / Math.PI + 360) % 360;
+}
 
 function setOrder(o) {
+  if (!o) return;
+  const prevStatus = order?.status;
+  const prevRider = order?.rider_id;
   order = o;
-  $('title').textContent = TN.STATUS[o.status] || 'Order';
-  $('orderIdLabel').textContent = 'Order ' + o.id;
-  $('rider').textContent = o.rider_id ? `🛵 ${o.rider_id}` : 'Searching nearby…';
-  renderStepper(o.status);
-  updateHudAndMetrics();
-}
 
-const STEPS = [
-  { key: 'placed', label: 'Placed' },
-  { key: 'accepted', label: 'Accepted' },
-  { key: 'preparing', label: 'Preparing' },
-  { key: 'picked_up', label: 'Out for delivery' },
-  { key: 'delivered', label: 'Delivered' },
-];
+  $('title').textContent = `Order #${o.id.slice(0, 8)}`;
+  $('orderIdLabel').textContent = o.id;
+  $('rider').textContent = o.rider_id ? `🛵 ${o.rider_id}` : 'Finding rider…';
 
-function renderStepper(status) {
-  if (status === 'cancelled') {
-    $('stepper').innerHTML = '<span style="color:var(--red);font-weight:700;font-size:13px">Order cancelled</span>';
-    return;
+  // Render Stepper
+  const steps = ['placed', 'accepted', 'preparing', 'picked_up', 'delivered'];
+  const curIdx = steps.indexOf(o.status);
+  $('stepper').innerHTML = steps.map((s, i) => `
+    <div class="step ${i < curIdx ? 'done' : i === curIdx ? 'active' : ''}">
+      <div class="step-dot">${i < curIdx ? '✓' : i + 1}</div>
+      <div class="step-label">${TN.STATUS[s]}</div>
+    </div>
+  `).join('');
+
+  // Restaurant pin
+  if (!restaurantMarker && o.pickup_lat && o.pickup_lng) {
+    restaurantMarker = L.marker([o.pickup_lat, o.pickup_lng], {
+      icon: createPinIcon('🍴', 'Restaurant', '#e07a16')
+    }).addTo(map);
   }
-  const idx = STEPS.findIndex((s) => s.key === status);
-  $('stepper').innerHTML = STEPS.map((s, i) => {
-    const cls = i < idx ? 'done' : i === idx ? 'active' : '';
-    const mark = i < idx ? '✓' : i + 1;
-    return `<div class="step ${cls}"><div class="step-dot">${mark}</div><div class="step-label">${s.label}</div></div>`;
-  }).join('');
+
+  // Customer pin
+  if (!customerMarker && o.drop_lat && o.drop_lng) {
+    customerMarker = L.marker([o.drop_lat, o.drop_lng], {
+      icon: createPinIcon('🏠', 'Delivery Address', '#0b7a75')
+    }).addTo(map);
+  }
+
+  // Update Road Routing based on Delivery Flow
+  if (o.status === 'placed' || o.status === 'accepted' || o.status === 'preparing') {
+    // Rider heads to restaurant
+    const startLat = (lastGpsPos ? lastGpsPos.lat : o.pickup_lat - 0.012);
+    const startLng = (lastGpsPos ? lastGpsPos.lng : o.pickup_lng - 0.012);
+    updateRoadRoute(startLat, startLng, o.pickup_lat, o.pickup_lng, 'to_pickup');
+  } else if (o.status === 'picked_up' || o.status === 'delivered') {
+    // Rider travels along real road route from restaurant to customer
+    updateRoadRoute(o.pickup_lat, o.pickup_lng, o.drop_lat, o.drop_lng, 'to_dropoff');
+  }
+
+  updateHudAndMetrics();
 }
 
 function updateHudAndMetrics() {
   if (!order) return;
-
   const st = order.status;
-  const hTitle = $('hudTitle'), hSub = $('hudSub'), hEta = $('hudEta'), hDist = $('hudDist'), hIcon = $('hudIcon');
+  const hTitle = $('hudTitle'), hSub = $('hudSub');
+  const hEta = $('hudEta'), hDist = $('hudDist'), hIcon = $('hudIcon');
   const phaseText = $('phaseText');
 
-  let curLat = order.pickup_lat, curLng = order.pickup_lng;
-  if (markerAnim) {
-    [curLat, curLng] = markerAnim.pos();
-  }
+  const roadDist = activeRoadDistance > 0 ? TN.fmtDist(activeRoadDistance) : '–';
+  const roadEta = activeRoadDuration > 0 ? TN.fmtEta(activeRoadDistance) : '–';
 
   if (st === 'placed') {
     hTitle.textContent = 'Order Placed';
-    hSub.textContent = 'Waiting for restaurant confirmation…';
-    hEta.textContent = '--';
-    hDist.textContent = 'Queued';
-    hIcon.textContent = '📝';
-    phaseText.textContent = 'Restaurant confirmation';
-  } else if (st === 'accepted') {
-    hTitle.textContent = order.rider_id ? `Rider ${order.rider_id} Assigned` : 'Order Accepted';
-    hSub.textContent = 'Rider heading to restaurant to collect food';
-    const dist = TN.hav(curLat, curLng, order.pickup_lat, order.pickup_lng);
-    hEta.textContent = TN.fmtEta(dist);
-    hDist.textContent = `${TN.fmtDist(dist)} to pickup`;
-    hIcon.textContent = '🛵';
-    phaseText.textContent = 'Heading to restaurant';
-    $('dist').textContent = `${TN.fmtDist(dist)} to pickup`;
-    $('eta').textContent = TN.fmtEta(dist);
-  } else if (st === 'preparing') {
-    hTitle.textContent = 'Kitchen Preparing Order';
-    hSub.textContent = 'Chef is cooking your fresh meal';
-    const dist = TN.hav(curLat, curLng, order.drop_lat, order.drop_lng);
-    hEta.textContent = 'Prep (~3m)';
-    hDist.textContent = `${TN.fmtDist(dist)} total`;
+    hSub.textContent = 'Restaurant is reviewing your order';
+    hEta.textContent = roadEta;
+    hDist.textContent = `${roadDist} route`;
+    hIcon.textContent = '📋';
+    phaseText.textContent = 'Placed';
+    $('dist').textContent = roadDist;
+    $('eta').textContent = 'Calculating…';
+  } else if (st === 'accepted' || st === 'preparing') {
+    hTitle.textContent = st === 'accepted' ? 'Order Confirmed' : 'Kitchen Preparing';
+    hSub.textContent = order.rider_id ? `Rider ${order.rider_id} assigned · en route to pickup` : 'Assigning nearest rider…';
+    hEta.textContent = roadEta;
+    hDist.textContent = `${roadDist} road`;
     hIcon.textContent = '🍳';
     phaseText.textContent = 'Kitchen Cooking';
-    $('dist').textContent = `${TN.fmtDist(dist)} total`;
-    $('eta').textContent = 'Prep in progress';
+    $('dist').textContent = `${roadDist} road`;
+    $('eta').textContent = roadEta;
   } else if (st === 'picked_up') {
     hTitle.textContent = 'Out for Delivery';
-    hSub.textContent = `Rider ${order.rider_id || ''} is on the way to your address!`;
-    const dist = TN.hav(curLat, curLng, order.drop_lat, order.drop_lng);
-    hEta.textContent = TN.fmtEta(dist);
-    hDist.textContent = `${TN.fmtDist(dist)} away`;
+    hSub.textContent = `Rider ${order.rider_id || ''} is following the road to your door!`;
+    hEta.textContent = roadEta;
+    hDist.textContent = `${roadDist} remaining`;
     hIcon.textContent = '🛵';
     phaseText.textContent = 'Out for Delivery';
-    $('dist').textContent = `${TN.fmtDist(dist)} to your home`;
-    $('eta').textContent = TN.fmtEta(dist);
+    $('dist').textContent = `${roadDist} to your home`;
+    $('eta').textContent = roadEta;
   } else if (st === 'delivered') {
     hTitle.textContent = 'Delivered! 🎉';
     hSub.textContent = 'Your order has arrived. Enjoy your meal!';
@@ -363,11 +454,18 @@ function updateHudAndMetrics() {
 
 function addNotif(n) {
   if (n.version <= lastVer && feed.has(n.version)) return false;
-  lastVer = Math.max(lastVer, n.version); feed.set(n.version, n);
+  lastVer = Math.max(lastVer, n.version);
+  feed.set(n.version, n);
   const sorted = [...feed.values()].sort((a, b) => b.version - a.version);
   const evCls = { delivered: 'ev-delivered', cancelled: 'ev-cancelled', placed: 'ev-placed' };
   $('feed').innerHTML = sorted.map((x) =>
-    `<li class="${evCls[x.status] || ''}"><div class="dot-ev"></div><div class="ev-info"><div class="ev-status">${TN.STATUS[x.status]}</div><div class="ev-time">${x.delivered_at ? new Date(x.delivered_at).toLocaleTimeString() : 'processed'} · v${x.version}</div></div></li>`
+    `<li class="${evCls[x.status] || ''}">
+      <div class="dot-ev"></div>
+      <div class="ev-info">
+        <div class="ev-status">${TN.STATUS[x.status]}</div>
+        <div class="ev-time">${x.delivered_at ? new Date(x.delivered_at).toLocaleTimeString() : 'processed'} · v${x.version}</div>
+      </div>
+    </li>`
   ).join('');
   return true;
 }
@@ -392,7 +490,6 @@ function paint() {
 
   $('age').textContent = lastLocAt ? Math.round((Date.now() - lastLocAt) / 1000) + ' s ago' : 'Live';
   updateHudAndMetrics();
-  map.dirty = true;
 }
 setInterval(paint, 1000);
 
@@ -418,20 +515,18 @@ const c = TN.connect({
       redisOk = d.redis;
       for (const n of d.notifications || []) addNotif(n);
       if (d.loc && d.loc.seq > lastSeq) {
-        if (!markerAnim) markerAnim = new TN.RiderMarker(d.loc.lat, d.loc.lng);
-        else markerAnim.update(d.loc.lat, d.loc.lng);
-        lastSeq = d.loc.seq; lastLocAt = Date.now();
-        trail.push([d.loc.lat, d.loc.lng]);
+        lastGpsPos = { lat: d.loc.lat, lng: d.loc.lng, hdg: 0 };
+        lastSeq = d.loc.seq;
+        lastLocAt = Date.now();
       }
-      refit();
     } else if (d.t === 'loc') {
       if (d.seq < lastSeq) { c.send({ t: 'back' }); return; }
       if (d.seq === lastSeq) return;
-      lastSeq = d.seq; lastLocAt = Date.now();
-      if (!markerAnim) markerAnim = new TN.RiderMarker(d.lat, d.lng);
-      else markerAnim.update(d.lat, d.lng);
-      trail.push([d.lat, d.lng]);
-      if (trail.length > 300) trail.shift();
+      const prev = lastGpsPos;
+      const hdg = prev ? calcHeading(prev.lat, prev.lng, d.lat, d.lng) : 0;
+      lastGpsPos = { lat: d.lat, lng: d.lng, hdg };
+      lastSeq = d.seq;
+      lastLocAt = Date.now();
       if (++shown % 5 === 0) c.send({ t: 'lat', ms: Date.now() - d.ts });
     } else if (d.t === 'notify') {
       const isNew = addNotif({ version: d.v, status: d.s, delivered_at: d.at });
@@ -447,4 +542,6 @@ const c = TN.connect({
     paint();
   }
 });
-</script></body></html>
+</script>
+</body>
+</html>

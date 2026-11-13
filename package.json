@@ -4,8 +4,10 @@
   "description": "TrackNow: trustworthy live dispatch (PS08 prototype). Zero npm dependencies; needs Node 22+ and Redis 6.2+.",
   "engines": { "node": ">=22.5" },
   "scripts": {
-    "start": "node dev/stack.js --real-redis",
+    "start": "node dev/stack.js --sim",
     "start:dev-redis": "node dev/stack.js",
+    "start:all": "node dev/stack.js --sim",
+    "start:real-redis": "node dev/stack.js --real-redis",
     "app1": "PORT=3001 INSTANCE_ID=app1 PEERS=http://localhost:3001,http://localhost:3002 node --no-warnings src/server.js",
     "app2": "PORT=3002 INSTANCE_ID=app2 PEERS=http://localhost:3001,http://localhost:3002 node --no-warnings src/server.js",
     "worker": "node --no-warnings src/worker.js",

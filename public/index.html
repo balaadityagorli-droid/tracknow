@@ -92,11 +92,14 @@ let M = null, peers = [], fitted = false;
 let hoveredRider = null;
 
 // ---- canvas ops map ----
-const map = new TN.MapView($('map'), { draw(x, p) {
+let map = null;
+map = new TN.MapView($('map'), { draw(x, p, view) {
   const now = Date.now();
   const A = $('fAvail').checked, B = $('fBusy').checked, O = $('fOld').checked;
   let nAvail = 0, nBusy = 0, nStale = 0;
-  const zoom = map.zoom;
+  const zoom = view ? view.zoom : (map ? map.zoom : 12);
+  const w = view ? view.w : (map ? map.w : 800);
+  const h = view ? view.h : (map ? map.h : 600);
 
   for (const [id, r] of riders) {
     const busy = r.st === 'busy';
@@ -106,7 +109,7 @@ const map = new TN.MapView($('map'), { draw(x, p) {
     else { nAvail++; if (!A) continue; }
 
     const [px, py] = p(r.lat, r.lng);
-    if (px < -15 || py < -15 || px > map.w + 15 || py > map.h + 15) continue;
+    if (px < -15 || py < -15 || px > w + 15 || py > h + 15) continue;
 
     if (busy) {
       // Delivering rider: prominent indigo badge with pulse
@@ -220,65 +223,70 @@ setInterval(() => (map.dirty = true), 500);
 ['fAvail', 'fBusy', 'fOld'].forEach((i) => $(i).addEventListener('change', () => (map.dirty = true)));
 
 // ---- proof rows ----
-const fmt = (n) => Number(n).toLocaleString(undefined, { maximumFractionDigits: 0 });
+const fmt = (n) => Number(n || 0).toLocaleString(undefined, { maximumFractionDigits: 0 });
 const fms = (v) => v == null ? '–' : (v >= 2000 ? '≥' : '≤') + fmt(v) + ' ms';
 function buildRows(m) {
-  const t = m.totals, L = m.latency, inv = m.inv, N = m.notif;
-  const up = m.instances.filter((i) => i.up);
+  if (!m) return [];
+  const t = m.totals || {}, L = m.latency || {}, inv = m.inv || {}, N = m.notif || {};
+  const instances = m.instances || [];
+  const up = instances.filter((i) => i && i.up);
   const R = [];
-  const act = m.riders.active, rate = m.rates.loc_in;
+  const act = (m.riders && m.riders.active) || 0;
+  const rate = (m.rates && m.rates.loc_in) || 0;
   R.push({ name: 'Riders reporting live', val: `${fmt(act)} riders · ${fmt(rate)}/s`, target: '2,000 riders @ 1 update/s',
     detail: `Riders heard from in the last 5 s. Accepted location updates/s across all instances.`,
     state: act === 0 ? 'none' : act >= 2000 && rate >= 1900 ? 'pass' : 'partial' });
 
-  const vt = m.viewers.total, withViewers = m.instances.filter((i) => i.up && i.viewers > 0).length;
-  R.push({ name: 'Customers tracking live', val: `${fmt(vt)} on ${withViewers}/${m.instances.length} instances`, target: '2,000+ viewers across 2+ instances',
-    detail: m.instances.map((i) => `${i.id}: ${fmt(i.viewers)} viewers${i.up ? '' : ' (DOWN)'}`).join(' · ') || 'No instances.',
+  const vt = (m.viewers && m.viewers.total) || 0;
+  const withViewers = instances.filter((i) => i && i.up && i.viewers > 0).length;
+  R.push({ name: 'Customers tracking live', val: `${fmt(vt)} on ${withViewers}/${instances.length} instances`, target: '2,000+ viewers across 2+ instances',
+    detail: instances.map((i) => `${i.id}: ${fmt(i.viewers)} viewers${i.up ? '' : ' (DOWN)'}`).join(' · ') || 'No instances.',
     state: vt === 0 ? 'none' : vt >= 2000 && withViewers >= 2 ? 'pass' : 'partial' });
 
   R.push({ name: 'Map update latency p95', val: fms(L.delivery_p95), target: '< 2,000 ms',
     detail: `Rider GPS send → customer map render, sampled from ${fmt(L.delivery_n)} viewer messages.`,
-    state: L.delivery_n < 20 ? 'none' : L.delivery_p95 < 2000 ? 'pass' : 'fail' });
+    state: (L.delivery_n || 0) < 20 ? 'none' : L.delivery_p95 < 2000 ? 'pass' : 'fail' });
 
   const polls = t.polling_requests || 0;
   R.push({ name: 'HTTP polling requests (must be zero)', val: fmt(polls), target: 'zero',
     detail: 'GET /api/track/* is refused HTTP 426. Any value > 0 means a client is polling instead of using WebSocket.',
     state: vt === 0 ? 'none' : polls === 0 ? 'pass' : 'fail' });
 
-  R.push({ name: 'Database location writes/s', val: `${m.rates.db_loc_writes.toFixed(1)}/s`, target: '< 50/s',
+  const db_writes = (m.rates && typeof m.rates.db_loc_writes === 'number') ? m.rates.db_loc_writes.toFixed(1) : '0.0';
+  R.push({ name: 'Database location writes/s', val: `${db_writes}/s`, target: '< 50/s',
     detail: `${fmt(t.db_loc_writes || 0)} total rows. Latest position lives in Redis; history is 1 row per rider per 90 s.`,
-    state: act === 0 ? 'none' : m.rates.db_loc_writes < 50 ? 'pass' : 'fail' });
+    state: act === 0 ? 'none' : (m.rates && m.rates.db_loc_writes < 50) ? 'pass' : 'fail' });
 
   R.push({ name: 'Nearest-rider search p95', val: fms(L.search_p95), target: '< 50 ms',
     detail: `${fmt(L.search_n)} GEOSEARCH calls · full assignment p95 ${fms(L.assign_p95)}.`,
-    state: L.search_n < 5 ? 'none' : L.search_p95 < 50 ? 'pass' : 'fail' });
+    state: (L.search_n || 0) < 5 ? 'none' : L.search_p95 < 50 ? 'pass' : 'fail' });
 
   const rsv = t.race_single_violations || 0;
-  R.push({ name: 'Double assignments (must be zero)', val: `${inv.double_assign_violations + rsv} violations`, target: 'zero',
-    detail: `${fmt(t.assign_conflicts_prevented || 0)} races won atomically · ${fmt(t.race_single_trials || 0)} single-race trials · ${fmt(inv.assigned_orders)} orders assigned.`,
-    state: inv.assigned_orders === 0 ? 'none' : inv.double_assign_violations + rsv > 0 ? 'fail' : 'pass' });
+  R.push({ name: 'Double assignments (must be zero)', val: `${(inv.double_assign_violations || 0) + rsv} violations`, target: 'zero',
+    detail: `${fmt(t.assign_conflicts_prevented || 0)} races won atomically · ${fmt(t.race_single_trials || 0)} single-race trials · ${fmt(inv.assigned_orders || 0)} orders assigned.`,
+    state: !inv.assigned_orders ? 'none' : ((inv.double_assign_violations || 0) + rsv > 0) ? 'fail' : 'pass' });
 
   const rbv = t.race_batch_violations || 0;
-  R.push({ name: 'Atomic batch assignment', val: `${inv.partial_batches + rbv} partial`, target: 'zero partial batches',
-    detail: `${fmt(inv.batches_committed)} batches committed · ${fmt(t.batch_failed_clean || 0)} refused cleanly · ${fmt(t.race_batch_trials || 0)} race trials.`,
-    state: !(t.batch_attempts) ? 'none' : inv.partial_batches + rbv > 0 ? 'fail' : 'pass' });
+  R.push({ name: 'Atomic batch assignment', val: `${(inv.partial_batches || 0) + rbv} partial`, target: 'zero partial batches',
+    detail: `${fmt(inv.batches_committed || 0)} batches committed · ${fmt(t.batch_failed_clean || 0)} refused cleanly · ${fmt(t.race_batch_trials || 0)} race trials.`,
+    state: !(t.batch_attempts) ? 'none' : ((inv.partial_batches || 0) + rbv > 0) ? 'fail' : 'pass' });
 
-  const nbad = inv.notif_out_of_order + inv.notif_missing + (t.notif_dup_visible || 0);
+  const nbad = (inv.notif_out_of_order || 0) + (inv.notif_missing || 0) + (t.notif_dup_visible || 0);
   R.push({ name: 'Notifications: exactly-once, in order', val: `${fmt(N.processed)} sent · ${fmt(N.pending)} pending`, target: 'zero duplicates or gaps',
-    detail: `${fmt(N.dup_suppressed)} repeats suppressed · ${nbad} bad · notifier ${N.worker}.`,
-    state: N.processed === 0 && N.pending === 0 ? 'none' : nbad > 0 ? 'fail' : N.pending > 0 ? 'partial' : 'pass', label: N.pending > 0 ? 'Draining…' : null });
+    detail: `${fmt(N.dup_suppressed)} repeats suppressed · ${nbad} bad · notifier ${N.worker || 'up'}.`,
+    state: !N.processed && !N.pending ? 'none' : nbad > 0 ? 'fail' : N.pending > 0 ? 'partial' : 'pass', label: N.pending > 0 ? 'Draining…' : null });
 
   const back = t.marker_backwards || 0, rej = (t.loc_rejected_stale || 0);
   R.push({ name: 'Rider marker never moves backwards', val: `${back} visible`, target: 'zero',
     detail: `${fmt(rej)} stale/duplicate GPS samples rejected before reaching any map.`,
     state: vt === 0 ? 'none' : back > 0 ? 'fail' : rej === 0 ? 'partial' : 'pass', label: vt > 0 && back === 0 && rej === 0 ? 'Not stress-tested' : null });
 
-  const down = m.instances.filter((i) => !i.up).map((i) => i.id);
-  R.push({ name: 'Instance failover speed', val: L.reconnect_n ? fms(L.reconnect_p95) : `${up.length}/${m.instances.length} up`, target: '< 5,000 ms',
+  const down = instances.filter((i) => i && !i.up).map((i) => i.id);
+  R.push({ name: 'Instance failover speed', val: L.reconnect_n ? fms(L.reconnect_p95) : `${up.length}/${instances.length} up`, target: '< 5,000 ms',
     detail: `${down.length ? down.join(', ') + ' DOWN · ' : ''}${fmt(t.reconnects || 0)} viewer failovers measured.`,
-    state: L.reconnect_n === 0 ? 'none' : L.reconnect_p95 < 5000 ? 'pass' : 'fail' });
+    state: !L.reconnect_n ? 'none' : L.reconnect_p95 < 5000 ? 'pass' : 'fail' });
 
-  const rd = m.redis, outages = t.redis_down_events || 0;
+  const rd = m.redis || {}, outages = t.redis_down_events || 0;
   R.push({ name: 'Redis interruption (fail-safe + recovery)', val: rd.up && rd.ready ? 'Up & ready' : rd.chaos ? 'Chaos active' : 'Down', target: 'fail closed, then auto-recover',
     detail: `${fmt(t.redis_refused || 0)} assignment attempts fail-closed · ${fmt(t.redis_recoveries || 0)} recoveries · ${outages} outages observed.`,
     state: !(rd.up && rd.ready) ? 'partial' : outages > 0 ? 'pass' : 'none', label: rd.chaos ? 'Chaos injected' : !(rd.up && rd.ready) ? 'Degraded (by design)' : null });
@@ -288,31 +296,43 @@ function buildRows(m) {
 const LABEL = { pass: 'Passing', fail: 'Failing', partial: 'Below target', none: 'Not tested yet' };
 const MARK  = { pass: '✓', fail: '✕', partial: '~', none: '·' };
 function renderProof(m) {
+  if (!m) return;
   const R = buildRows(m), c = { pass: 0, fail: 0, partial: 0, none: 0 };
-  $('rows').innerHTML = R.map((r) => {
-    c[r.state]++;
-    return `<div class="row ${r.state}">
-      <div class="mark" aria-hidden="true" title="${LABEL[r.state]}">${MARK[r.state]}</div>
-      <div class="name">${r.name}</div>
-      <div class="val num">${r.val}</div>
-      <div class="detail">${r.detail}</div>
-      <div class="target"><span class="state">${r.label || LABEL[r.state]}</span> · target: ${r.target}</div>
-    </div>`;
-  }).join('');
-  $('tally').textContent =
-    `${c.pass} of ${R.length} passing · ${c.partial} below target · ${c.fail} failing · ${c.none} not tested`;
+  const rowsEl = $('rows');
+  if (rowsEl) {
+    rowsEl.innerHTML = R.map((r) => {
+      c[r.state]++;
+      return `<div class="row ${r.state}">
+        <div class="mark" aria-hidden="true" title="${LABEL[r.state]}">${MARK[r.state]}</div>
+        <div class="name">${r.name}</div>
+        <div class="val num">${r.val}</div>
+        <div class="detail">${r.detail}</div>
+        <div class="target"><span class="state">${r.label || LABEL[r.state]}</span> · target: ${r.target}</div>
+      </div>`;
+    }).join('');
+  }
+  const tallyEl = $('tally');
+  if (tallyEl) {
+    tallyEl.textContent =
+      `${c.pass} of ${R.length} passing · ${c.partial} below target · ${c.fail} failing · ${c.none} not tested`;
+  }
 
-  const w = m.notif.worker;
+  const w = (m.notif && m.notif.worker) || 'up';
   setChip('cWorker', w === 'up' ? 'ok' : w === 'paused' ? 'warn' : 'bad',
     `Notifier ${w === 'up' ? 'running' : w}`);
-  setChip('cRedis', m.redis.up && m.redis.ready ? 'ok' : 'bad',
-    m.redis.chaos ? 'Redis (chaos)' : m.redis.up && m.redis.ready ? 'Redis OK' : 'Redis DOWN');
+  const rd = m.redis || {};
+  setChip('cRedis', rd.up && rd.ready ? 'ok' : 'bad',
+    rd.chaos ? 'Redis (chaos)' : rd.up && rd.ready ? 'Redis OK' : 'Redis DOWN');
 
   const bn = $('banner');
-  if (!(m.redis.up && m.redis.ready)) {
-    bn.textContent = m.redis.chaos ? 'Redis chaos active — assignments paused, tracking stale' : 'Redis unavailable — assignments paused';
-    bn.className = 'banner show bad';
-  } else bn.className = 'banner';
+  if (bn) {
+    if (!(rd.up && rd.ready)) {
+      bn.textContent = rd.chaos ? 'Redis chaos active — assignments paused, tracking stale' : 'Redis unavailable — assignments paused';
+      bn.className = 'banner show bad';
+    } else {
+      bn.className = 'banner';
+    }
+  }
 }
 function setChip(id, cls, text) { const e = $(id); e.className = 'chip ' + cls; e.querySelector('b').textContent = text; }
 
@@ -345,21 +365,28 @@ TN.connect({ kind: 'ops',
     }
   },
   onMsg: (d) => {
-    if (d.t === 'snap') {
-      riders.clear();
-      for (const r of d.riders || []) riders.set(r[0], { lat: r[1], lng: r[2], st: r[3], ts: r[4] });
-      orders.clear(); for (const o of d.orders || []) orders.set(o.id, o);
-      renderOrders(); map.dirty = true;
-    } else if (d.t === 'riders') {
-      for (const r of d.d) riders.set(r[0], { lat: r[1], lng: r[2], st: r[3], ts: r[4] });
-      map.dirty = true;
-    } else if (d.t === 'metrics') {
-      M = d.d; renderProof(M);
-      $('pause').textContent = M.notif.worker === 'paused' ? 'Resume notifier' : 'Pause notifier';
-    } else if (d.t === 'order') {
-      orders.set(d.order.id, d.order); renderOrders();
-    } else if (d.t === 'reset') {
-      riders.clear(); orders.clear(); renderOrders(); map.dirty = true;
+    try {
+      if (d.t === 'snap') {
+        riders.clear();
+        for (const r of d.riders || []) riders.set(r[0], { lat: r[1], lng: r[2], st: r[3], ts: r[4] });
+        orders.clear(); for (const o of d.orders || []) orders.set(o.id, o);
+        renderOrders(); map.dirty = true;
+      } else if (d.t === 'riders') {
+        for (const r of d.d || []) riders.set(r[0], { lat: r[1], lng: r[2], st: r[3], ts: r[4] });
+        map.dirty = true;
+      } else if (d.t === 'metrics') {
+        M = d.d; renderProof(M);
+        const pBtn = $('pause');
+        if (pBtn && M && M.notif) {
+          pBtn.textContent = M.notif.worker === 'paused' ? 'Resume notifier' : 'Pause notifier';
+        }
+      } else if (d.t === 'order') {
+        if (d.order && d.order.id) { orders.set(d.order.id, d.order); renderOrders(); }
+      } else if (d.t === 'reset') {
+        riders.clear(); orders.clear(); renderOrders(); map.dirty = true;
+      }
+    } catch (err) {
+      console.error('Error handling WebSocket message:', err);
     }
   }
 });
